@@ -30,6 +30,7 @@
 #define LOCK_PATH     "/data/local/tmp/.sudo.lock"
 #define SERVER_FLAG   "--server-daemon"
 #define ROOT_HOME     "/data/data/com.termux/files/home/.suroot"
+#define ROOT_TMP      ROOT_HOME "/.tmp"
 #define DEFAULT_SHELL "/data/data/com.termux/files/usr/bin/bash"
 
 #define MAX_ENV_SIZE  (1u << 20)   /* cap on the client-supplied env blob */
@@ -264,6 +265,15 @@ static void drop_privileges(const struct sudo_req *req)
   }
 }
 
+/* Overrides client HOME/TMPDIR; call after apply_environment. */
+static void setup_root_env(void)
+{
+  mkdir(ROOT_HOME, 0700);
+  mkdir(ROOT_TMP, 0700);
+  setenv("HOME", ROOT_HOME, 1);
+  setenv("TMPDIR", ROOT_TMP, 1);
+}
+
 static void run_child(struct sudo_req *req, char *env_buf, uint32_t env_size,
                       int slave_fd)
 {
@@ -284,6 +294,9 @@ static void run_child(struct sudo_req *req, char *env_buf, uint32_t env_size,
     apply_environment(env_buf, env_size);
   drop_privileges(req);
 
+  if (req->uid == 0)
+    setup_root_env();
+
   if (!req->flag_i) {
     size_t cwd_len = strnlen(req->cwd, sizeof(req->cwd));
 
@@ -302,8 +315,6 @@ static void run_child(struct sudo_req *req, char *env_buf, uint32_t env_size,
     const char *base = strrchr(shell, '/');
     static char login_argv0[64];
 
-    mkdir(ROOT_HOME, 0700);
-    setenv("HOME", ROOT_HOME, 1);
     setenv("USER", "root", 1);
     setenv("LOGNAME", "root", 1);
     if (chdir(ROOT_HOME) != 0 && chdir("/") != 0) {
