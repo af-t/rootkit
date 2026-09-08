@@ -16,6 +16,10 @@ make
 ```
 
 Produces a single `rootlet` binary. Compiled with `-Wall -Wextra -Werror`.
+`LDFLAGS`/`LDLIBS` are honored at link time. For profile-guided
+optimization: `make PGO=generate`, exercise every binary's real code
+paths, `make clean`, `make PGO=use` (`PROFDIR` overrides the profile
+directory; with clang, run `make pgo-merge` before the use build).
 
 ## Usage
 
