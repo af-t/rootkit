@@ -2,7 +2,7 @@
 
 A tiny chroot launcher for running a Linux distribution from a disk image,
 built for Android. It attaches an image to a loop device, mounts its root
-filesystem, binds the host `/dev`, `/proc`, `/sys` and `/sdcard` into it, then
+filesystem, binds the host `/dev`, `/proc` and `/sys` into it, then
 `chroot`s in and starts a login shell (`su -`) on its own pseudo-terminal.
 On exit it tears everything back down: it kills the session's processes,
 unmounts, and detaches the loop device. The same teardown runs when rootlet is
@@ -49,7 +49,7 @@ stays private to the session. Networking and hostname remain shared with the
 host. If the kernel lacks PID namespace support, rootlet prints a warning and
 falls back to a normal (non-isolated) session.
 
-Besides the standard binds (`/dev`, `/proc`, `/sys`, `/sdcard`, …), `-b` adds
+Besides the standard binds (`/dev`, `/proc`, `/sys`, …), `-b` adds
 extra ones, and the target directory is created if the image lacks it:
 
 ```sh

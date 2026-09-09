@@ -453,8 +453,6 @@ static int mount_point_busy(void)
 
 static void do_mount(void)
 {
-  const char *sdcard;
-
   if (mount_point_busy()) {
     fprintf(stderr, "%s: already a mount point, unmount it first\n",
       chroot_path);
@@ -468,18 +466,16 @@ static void do_mount(void)
 
   mount_rootfs();
 
+  /* Detach the tree from its peer group, so the mounts below only show up
+     here and peers just see chroot_path itself. */
+  mount_soft(NULL, chroot_path, NULL, MS_REC | MS_PRIVATE, NULL);
+
   mount_soft("/sys", cp("/sys"), NULL, MS_BIND, NULL);
   mount_soft("/dev", cp("/dev"), NULL, MS_BIND, NULL);
   mount_soft("/dev/pts", cp("/dev/pts"), NULL, MS_BIND, NULL);
   mount_soft("proc", cp("/proc"), "proc", 0, NULL);
   mount_soft("tmpfs", cp("/mnt"), "tmpfs", 0, "size=20%,mode=0755");
   mount_soft("tmpfs", cp("/tmp"), "tmpfs", 0, "size=50%,mode=1777");
-
-  sdcard = cp("/mnt/sdcard");
-  if (mkdir_p(sdcard, NULL) != 0)
-    fprintf(stderr, "mkdir %s: %s\n", sdcard, strerror(errno));
-  else
-    mount_soft("/sdcard", sdcard, NULL, MS_BIND, NULL);
 
   mount_binds();
 
