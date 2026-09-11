@@ -274,6 +274,239 @@ static void setup_root_env(void)
   setenv("TMPDIR", ROOT_TMP, 1);
 }
 
+/* Best-effort escape from the caller's cgroup into init's (PID 1) cgroup, so
+   the daemon and its children are not frozen/killed with the Termux app that
+   first invoked sudo. Never fatal: on any failure the process simply stays
+   where it is. Must run while still root (moving needs write access). */
+#define CG_MAX_ENTRIES 16
+#define CG_MAX_MNTS 16
+
+struct cg_entry {
+  int hid;
+  char path[PATH_MAX];
+};
+
+/* "0::/..." (v2) or "N:ctrls:/..." (v1); returns entries parsed. */
+static int read_cgroup_file(const char *file, struct cg_entry *out, int cap)
+{
+  char line[PATH_MAX + 64];
+  int n = 0;
+  FILE *fp = fopen(file, "r");
+
+  if (!fp)
+    return 0;
+
+  while (n < cap && fgets(line, sizeof(line), fp)) {
+    char *c1 = strchr(line, ':');
+    char *c2;
+    char *nl;
+
+    if (!c1)
+      continue;
+    c2 = strchr(c1 + 1, ':');
+    if (!c2)
+      continue;
+    nl = strchr(c2 + 1, '\n');
+    if (nl)
+      *nl = '\0';
+
+    /* Skip a truncated line that filled the buffer without a newline. */
+    if (!nl && !feof(fp))
+      continue;
+
+    out[n].hid = atoi(line);
+    if ((size_t)snprintf(out[n].path, sizeof(out[n].path), "%s", c2 + 1) >=
+        sizeof(out[n].path))
+      continue;
+    if (out[n].path[0] != '/')
+      continue;
+    n++;
+  }
+
+  fclose(fp);
+  return n;
+}
+
+/* Unescape octal (\040 etc.) in place, as mount paths use in /proc/mounts. */
+static void unescape_mnt(char *s)
+{
+  char *out = s;
+
+  while (*s) {
+    if (s[0] == '\\' && s[1] >= '0' && s[1] <= '7' &&
+        s[2] >= '0' && s[2] <= '7' && s[3] >= '0' && s[3] <= '7') {
+      *out++ = (char)(((s[1] - '0') << 6) | ((s[2] - '0') << 3) |
+           (s[3] - '0'));
+      s += 4;
+      continue;
+    }
+    *out++ = *s++;
+  }
+
+  *out = '\0';
+}
+
+/* Collect mount points of one fstype ("cgroup" or "cgroup2"). */
+static int collect_mounts(const char *fstype, char out[][PATH_MAX], int cap)
+{
+  char line[PATH_MAX * 2 + 256];
+  int n = 0;
+  FILE *fp = fopen("/proc/self/mounts", "r");
+
+  if (!fp)
+    return 0;
+
+  while (fgets(line, sizeof(line), fp)) {
+    char *src_end, *mnt, *mnt_end, *type, *type_end;
+
+    if (!strchr(line, '\n') && !feof(fp))
+      continue;   /* truncated line */
+
+    src_end = strchr(line, ' ');
+    if (!src_end)
+      continue;
+    mnt = src_end + 1 + strspn(src_end + 1, " ");
+    mnt_end = strchr(mnt, ' ');
+    if (!mnt_end)
+      continue;
+    *mnt_end = '\0';
+    type = mnt_end + 1 + strspn(mnt_end + 1, " ");
+    type_end = strchr(type, ' ');
+    if (!type_end)
+      continue;
+    *type_end = '\0';
+
+    if (strcmp(type, fstype) != 0)
+      continue;
+    if (n >= cap)
+      break;
+
+    unescape_mnt(mnt);
+    if ((size_t)snprintf(out[n], PATH_MAX, "%s", mnt) >= PATH_MAX)
+      continue;
+    n++;
+  }
+
+  fclose(fp);
+  return n;
+}
+
+static int move_pid_to_dir(const char *dir, const char *pid_str, size_t pid_len)
+{
+  static const char *const files[] = { "cgroup.procs", "tasks" };
+  size_t i;
+
+  for (i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+    char target[PATH_MAX];
+    int fd;
+    size_t off = 0;
+    int ok;
+
+    if ((size_t)snprintf(target, sizeof(target), "%s/%s", dir,
+             files[i]) >= sizeof(target))
+      continue;
+
+    fd = open(target, O_WRONLY | O_CLOEXEC);
+    if (fd < 0)
+      continue;
+
+    ok = 1;
+    while (off < pid_len) {
+      ssize_t w = write(fd, pid_str + off, pid_len - off);
+
+      if (w < 0) {
+        if (errno == EINTR)
+          continue;
+        ok = 0;
+        break;
+      }
+      off += (size_t)w;
+    }
+    close(fd);
+
+    if (ok)
+      return 1;
+  }
+
+  return 0;
+}
+
+/* Try mount/init_path, then its parents up to the mount root. Moving higher
+   only escapes further, so falling back upward is always safe. */
+static void move_to_init_path(const char *mnt, const char *init_path,
+            const char *pid_str, size_t pid_len)
+{
+  char cur[PATH_MAX];
+  size_t mnt_len = strlen(mnt);
+
+  if ((size_t)snprintf(cur, sizeof(cur), "%s", init_path) >= sizeof(cur))
+    return;
+
+  for (;;) {
+    char dir[PATH_MAX];
+    size_t need = mnt_len + strlen(cur) + 1;
+    char *slash;
+
+    if (need > sizeof(dir) - 1)
+      return;
+    if (strcmp(cur, "/") == 0)
+      snprintf(dir, sizeof(dir), "%s", mnt);
+    else
+      snprintf(dir, sizeof(dir), "%s%s", mnt, cur);
+
+    if (move_pid_to_dir(dir, pid_str, pid_len))
+      return;
+    if (strcmp(cur, "/") == 0)
+      return;
+
+    slash = strrchr(cur, '/');
+    if (!slash)
+      return;
+    if (slash == cur)
+      cur[1] = '\0';
+    else
+      *slash = '\0';
+  }
+}
+
+static void escape_cgroup(void)
+{
+  struct cg_entry self[CG_MAX_ENTRIES], init[CG_MAX_ENTRIES];
+  char v1mnts[CG_MAX_MNTS][PATH_MAX], v2mnts[CG_MAX_MNTS][PATH_MAX];
+  char pid_str[32];
+  size_t pid_len;
+  int nself, ninit, nv1, nv2, i;
+
+  pid_len = (size_t)snprintf(pid_str, sizeof(pid_str), "%d", (int)getpid());
+  if (pid_len == 0 || pid_len >= sizeof(pid_str))
+    return;
+
+  nself = read_cgroup_file("/proc/self/cgroup", self, CG_MAX_ENTRIES);
+  if (nself == 0)
+    return;
+  ninit = read_cgroup_file("/proc/1/cgroup", init, CG_MAX_ENTRIES);
+  nv1 = collect_mounts("cgroup", v1mnts, CG_MAX_MNTS);
+  nv2 = collect_mounts("cgroup2", v2mnts, CG_MAX_MNTS);
+
+  for (i = 0; i < nself; i++) {
+    const char *init_path = "/";
+    int is_v2 = (self[i].hid == 0);
+    char (*mnts)[PATH_MAX] = is_v2 ? v2mnts : v1mnts;
+    int nmnts = is_v2 ? nv2 : nv1;
+    int j, k;
+
+    for (j = 0; j < ninit; j++) {
+      if (init[j].hid == self[i].hid) {
+        init_path = init[j].path;
+        break;
+      }
+    }
+
+    for (k = 0; k < nmnts; k++)
+      move_to_init_path(mnts[k], init_path, pid_str, pid_len);
+  }
+}
+
 static void run_child(struct sudo_req *req, char *env_buf, uint32_t env_size,
                       int slave_fd)
 {
@@ -281,6 +514,9 @@ static void run_child(struct sudo_req *req, char *env_buf, uint32_t env_size,
   int argi = 0;
   char *exec_path;
   char *shell;
+
+  /* Still root here: leave the caller's cgroup before dropping privileges. */
+  escape_cgroup();
 
   setsid();
   ioctl(slave_fd, TIOCSCTTY, 0);
@@ -492,6 +728,10 @@ static void run_server(void)
   }
 
   daemonize();
+
+  /* The daemon inherits the cgroup of whoever first started it; move to
+     init's so later sessions never sit in a client's app cgroup. */
+  escape_cgroup();
 
   if (ftruncate(lock_fd, 0) == 0)
     dprintf(lock_fd, "%d\n", getpid());

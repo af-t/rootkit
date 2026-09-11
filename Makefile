@@ -67,11 +67,12 @@ $(LIB): %.o: %.c $(HDR)
 install: $(TARGET)
 	install -D -m 0755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
 
-# Merge clang raw profiles for the use build.
+# Merge clang raw profiles for the use build. Plain merge: -sparse drops
+# records the use build needs, failing it under -Werror.
 LLVM_PROFDATA ?= llvm-profdata
 pgo-merge:
 	@test -n "$(wildcard $(PROFDIR)/*.profraw)" || { echo "pgo-merge: no .profraw in $(PROFDIR)"; exit 1; }
-	"$(LLVM_PROFDATA)" merge -sparse -o "$(PROFDIR)/merged.profdata" "$(PROFDIR)"/*.profraw
+	"$(LLVM_PROFDATA)" merge -o "$(PROFDIR)/merged.profdata" "$(PROFDIR)"/*.profraw
 
 clean:
 	rm -f $(TARGET) sudo connect *.o *.gcno *.gcda
