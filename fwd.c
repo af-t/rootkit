@@ -136,7 +136,7 @@ static int keep_contains(const int *keep, int nkeep, int fd)
 
 /* Close every fd >= lo except those in keep. Enumerates /proc/self/fd so
    only open fds are touched (a bounded sweep is the fallback). */
-static void close_from(int lo, const int *keep, int nkeep)
+void fwd_close_from(int lo, const int *keep, int nkeep)
 {
   DIR *d = opendir("/proc/self/fd");
 
@@ -210,7 +210,7 @@ void fwd_install(uint64_t mask, int *recv, int n, int lo)
 
   /* Everything at/above lo goes except the stash; stash sits above
      FWD_STASH_BASE so it always survives this. */
-  close_from(lo, stash, n);
+  fwd_close_from(lo, stash, n);
 
   for (int i = 0; i < n; i++) {
     if (dup2(stash[i], targets[i]) < 0)

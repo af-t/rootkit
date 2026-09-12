@@ -26,6 +26,7 @@
 
 #include <pthread.h>
 
+#include "fwd.h"
 #include "io.h"
 #include "tty.h"
 
@@ -37,6 +38,7 @@
 struct connect_hello {
   unsigned short rows;
   unsigned short cols;
+  int pipe_mode;   /* 0 = pty (0,1,2 are ttys), 1 = relay pipes, no pty */
 };
 
 extern char **environ;
@@ -126,21 +128,14 @@ static void apply_lc_blob(const char *blob, uint32_t size)
   }
 }
 
-static void run_child(const char *lc_blob, uint32_t lc_size, int slave_fd)
+/* Shared exec tail: locale overrides, then a login shell. Never returns. */
+static void exec_login_shell(const char *lc_blob, uint32_t lc_size)
 {
   struct passwd *pw;
   const char *shell;
   const char *base;
   static char login_argv0[64];
   char *exec_args[2];
-
-  setsid();
-  ioctl(slave_fd, TIOCSCTTY, 0);
-  dup2(slave_fd, STDIN_FILENO);
-  dup2(slave_fd, STDOUT_FILENO);
-  dup2(slave_fd, STDERR_FILENO);
-  if (slave_fd > STDERR_FILENO)
-    close(slave_fd);
 
   /* Apply the client's locale overrides (LANG, LC_*). */
   if (lc_blob && lc_size > 0)
@@ -175,9 +170,44 @@ static void run_child(const char *lc_blob, uint32_t lc_size, int slave_fd)
   _exit(126);
 }
 
+static void run_child(const char *lc_blob, uint32_t lc_size, int slave_fd)
+{
+  setsid();
+  ioctl(slave_fd, TIOCSCTTY, 0);
+  dup2(slave_fd, STDIN_FILENO);
+  dup2(slave_fd, STDOUT_FILENO);
+  dup2(slave_fd, STDERR_FILENO);
+  if (slave_fd > STDERR_FILENO)
+    close(slave_fd);
+
+  fwd_close_from(3, NULL, 0);
+  exec_login_shell(lc_blob, lc_size);
+}
+
+/* Pipe mode: same shell, but stdin/stdout/stderr are relay pipes with no
+   controlling terminal (TCP cannot pass fds, so streams are relayed). */
+static void run_child_pipes(const char *lc_blob, uint32_t lc_size,
+                            int stdin_r, int stdout_w, int stderr_w)
+{
+  setsid();
+  dup2(stdin_r, STDIN_FILENO);
+  dup2(stdout_w, STDOUT_FILENO);
+  dup2(stderr_w, STDERR_FILENO);
+  if (stdin_r > STDERR_FILENO)
+    close(stdin_r);
+  if (stdout_w > STDERR_FILENO)
+    close(stdout_w);
+  if (stderr_w > STDERR_FILENO)
+    close(stderr_w);
+
+  fwd_close_from(3, NULL, 0);
+  exec_login_shell(lc_blob, lc_size);
+}
+
 #define PKT_DATA  1
 #define PKT_WINCH 2
 #define PKT_EXIT  3
+#define PKT_STDERR 4   /* pipe mode: server->client stderr (DATA = stdout) */
 
 struct pkt_hdr {
   uint8_t  type;
@@ -308,6 +338,271 @@ static void *session_thread(void *arg)
   return NULL;
 }
 
+struct pipe_args {
+  int      client_fd;
+  int      stdin_w;
+  int      stdout_r;
+  int      stderr_r;
+  pid_t    child_pid;
+};
+
+/* Upper bound for one poll() sleep with no fd events. A child that exits
+   after its pipes already reached EOF produces no further events (both
+   pipes poll as -1 while the socket may stay idle), so without a bound the
+   waitpid() at the top of the loop would never run again and the exit
+   status would never be sent. */
+#define REAP_POLL_MS 200
+
+/* Pipe mode relay: child stdout/stderr arrive on separate pipes and go
+   out as PKT_DATA/PKT_STDERR; client PKT_DATA feeds child stdin, and an
+   empty PKT_DATA means stdin EOF (the socket itself stays open, so a
+   later disconnect is still told apart from EOF and kills the child). */
+static void *pipe_session_thread(void *arg)
+{
+  struct pipe_args *pa = arg;
+  int      client_fd = pa->client_fd;
+  int      stdin_w   = pa->stdin_w;
+  int      stdout_r  = pa->stdout_r;
+  int      stderr_r  = pa->stderr_r;
+  pid_t    child_pid = pa->child_pid;
+  char     buf[4096];
+  struct   pollfd pf[3];
+  struct   timespec deadline;
+  int      status = -1;
+  int      reaped = 0;
+  int      in_open = 1, out_eof = 0, err_eof = 0, ending = 0;
+
+  free(pa);
+
+  /* Remove the handshake timeout set before the thread was spawned. */
+  {
+    struct timeval zero = { 0, 0 };
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
+  }
+
+  for (;;) {
+    pid_t wp = waitpid(child_pid, &status, WNOHANG);
+    int timeout = REAP_POLL_MS;
+    int r;
+
+    if (wp > 0)
+      reaped = 1;
+    if (reaped && out_eof && err_eof)
+      break;
+
+    /* Child gone: take what the pipes still hold, then leave. */
+    if (reaped && !ending) {
+      clock_gettime(CLOCK_MONOTONIC, &deadline);
+      deadline.tv_nsec += DRAIN_MS * 1000000L;
+      if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_nsec -= 1000000000L;
+        deadline.tv_sec++;
+      }
+      ending = 1;
+    }
+    if (ending) {
+      int left = ms_until(&deadline);
+      if (left < timeout)
+        timeout = left;
+    }
+
+    pf[0].fd      = out_eof ? -1 : stdout_r;
+    pf[0].events  = POLLIN;
+    pf[0].revents = 0;
+    pf[1].fd      = err_eof ? -1 : stderr_r;
+    pf[1].events  = POLLIN;
+    pf[1].revents = 0;
+    pf[2].fd      = client_fd;
+    pf[2].events  = POLLIN;
+    pf[2].revents = 0;
+
+    r = poll(pf, 3, timeout);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    if (r == 0) {
+      /* No events in time: leave only when the drain deadline elapsed,
+         otherwise loop back and re-check the child. */
+      if (ending && ms_until(&deadline) == 0)
+        break;
+      continue;
+    }
+
+    if (pf[0].revents & POLLIN) {
+      ssize_t n = read(stdout_r, buf, sizeof(buf));
+      if (n < 0 && errno == EINTR)
+        continue;
+      if (n <= 0)
+        out_eof = 1;
+      else if (send_pkt(client_fd, PKT_DATA, buf, (uint32_t)n) != 0)
+        break;
+    } else if (pf[0].revents & (POLLHUP | POLLERR)) {
+      out_eof = 1;
+    }
+
+    if (pf[1].revents & POLLIN) {
+      ssize_t n = read(stderr_r, buf, sizeof(buf));
+      if (n < 0 && errno == EINTR)
+        continue;
+      if (n <= 0)
+        err_eof = 1;
+      else if (send_pkt(client_fd, PKT_STDERR, buf, (uint32_t)n) != 0)
+        break;
+    } else if (pf[1].revents & (POLLHUP | POLLERR)) {
+      err_eof = 1;
+    }
+
+    /* Any readability here is either an input packet or a dead client:
+       packets keep flowing, anything else ends the session. */
+    if (pf[2].revents & (POLLIN | POLLHUP | POLLERR)) {
+      uint8_t type;
+      uint32_t len;
+      if (recv_pkt(client_fd, &type, buf, sizeof(buf), &len) != 0)
+        break;
+      if (type == PKT_DATA && in_open) {
+        if (len == 0) {
+          in_open = 0;
+          close(stdin_w);
+        } else if (write_all(stdin_w, buf, len) != 0) {
+          in_open = 0;
+          close(stdin_w);
+        }
+      }
+      /* PKT_WINCH and anything else: no pty here, ignore. */
+    }
+  }
+
+  if (!reaped) {
+    kill(child_pid, SIGHUP);
+    if (waitpid(child_pid, &status, 0) < 0)
+      status = -1;
+  }
+
+  {
+    int32_t net_status = htonl((int32_t)status);
+    send_pkt(client_fd, PKT_EXIT, &net_status, sizeof(net_status));
+  }
+
+  if (in_open)
+    close(stdin_w);
+  close(stdout_r);
+  close(stderr_r);
+  close(client_fd);
+  return NULL;
+}
+
+static int make_pipe(int p[2])
+{
+  if (pipe2(p, O_CLOEXEC) == 0)
+    return 0;
+  if (pipe(p) != 0)
+    return -1;
+  fcntl(p[0], F_SETFD, FD_CLOEXEC);
+  fcntl(p[1], F_SETFD, FD_CLOEXEC);
+  return 0;
+}
+
+/* Pipe mode accept path: no pty, child stdio are relay pipes owned by
+   a detached thread. Takes over lc_blob (frees it) and client_fd. */
+static void handle_pipe_connection(int server_fd, int client_fd,
+                                   char *lc_blob, uint32_t lc_size)
+{
+  int in_p[2] = { -1, -1 }, out_p[2] = { -1, -1 }, err_p[2] = { -1, -1 };
+  struct pipe_args *pa;
+  pthread_t tid;
+  pthread_attr_t attr;
+  uint8_t ok;
+  pid_t pid;
+
+  if (make_pipe(in_p) != 0 || make_pipe(out_p) != 0 ||
+      make_pipe(err_p) != 0) {
+    ok = 0;
+    write_all(client_fd, &ok, sizeof(ok));
+    goto fail;
+  }
+
+  pid = fork();
+  if (pid == 0) {
+    close(server_fd);
+    close(client_fd);
+    close(in_p[1]);
+    close(out_p[0]);
+    close(err_p[0]);
+    run_child_pipes(lc_blob, lc_size, in_p[0], out_p[1], err_p[1]);
+  }
+
+  close(in_p[0]);
+  in_p[0] = -1;
+  close(out_p[1]);
+  out_p[1] = -1;
+  close(err_p[1]);
+  err_p[1] = -1;
+  free(lc_blob);
+  lc_blob = NULL;
+
+  if (pid < 0) {
+    ok = 0;
+    write_all(client_fd, &ok, sizeof(ok));
+    goto fail;
+  }
+
+  /* Tell the client the shell is ready. */
+  ok = 1;
+  if (write_all(client_fd, &ok, sizeof(ok)) != 0) {
+    kill(pid, SIGKILL);
+    goto fail;
+  }
+
+  pa = malloc(sizeof(*pa));
+  if (!pa) {
+    kill(pid, SIGKILL);
+    close(client_fd);
+    close(in_p[1]);
+    close(out_p[0]);
+    close(err_p[0]);
+    free(lc_blob);
+    return;
+  }
+  pa->client_fd = client_fd;
+  pa->stdin_w   = in_p[1];
+  pa->stdout_r  = out_p[0];
+  pa->stderr_r  = err_p[0];
+  pa->child_pid = pid;
+
+  pthread_attr_init(&attr);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  if (pthread_create(&tid, &attr, pipe_session_thread, pa) != 0) {
+    free(pa);
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, WNOHANG);
+    close(client_fd);
+    close(in_p[1]);
+    close(out_p[0]);
+    close(err_p[0]);
+    free(lc_blob);
+    return;
+  }
+  pthread_attr_destroy(&attr);
+  return;
+
+fail:
+  close(client_fd);
+  free(lc_blob);
+  if (in_p[0] >= 0)
+    close(in_p[0]);
+  if (in_p[1] >= 0)
+    close(in_p[1]);
+  if (out_p[0] >= 0)
+    close(out_p[0]);
+  if (out_p[1] >= 0)
+    close(out_p[1]);
+  if (err_p[0] >= 0)
+    close(err_p[0]);
+  if (err_p[1] >= 0)
+    close(err_p[1]);
+}
+
 static void handle_connection(int server_fd)
 {
   struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
@@ -341,7 +636,8 @@ static void handle_connection(int server_fd)
 
   if (read_all(client_fd, &hello, sizeof(hello)) != 0 ||
       read_all(client_fd, &lc_size, sizeof(lc_size)) != 0 ||
-      lc_size > (1u << 16)) {
+      lc_size > (1u << 16) ||
+      (hello.pipe_mode != 0 && hello.pipe_mode != 1)) {
     close(client_fd);
     return;
   }
@@ -354,6 +650,9 @@ static void handle_connection(int server_fd)
       return;
     }
   }
+
+  if (hello.pipe_mode)
+    return handle_pipe_connection(server_fd, client_fd, lc_blob, lc_size);
 
   ws.ws_row    = hello.rows ? hello.rows : 24;
   ws.ws_col    = hello.cols ? hello.cols : 80;
@@ -479,6 +778,79 @@ static void run_server(const char *host, int port, int foreground)
 
   close(server_fd);
   exit(0);
+}
+
+/* Pipe mode client: stdin feeds the remote shell, remote stdout/stderr
+   come back as PKT_DATA/PKT_STDERR. No pty, no raw mode, no window
+   updates. An empty PKT_DATA marks our stdin EOF; the socket stays open
+   for output and the exit status. */
+static int run_client_pipe_loop(int sock_fd)
+{
+  struct pollfd fds[2];
+  char buf[4096];
+  int raw_status  = -1;
+  int stdin_open  = 1;
+  int sock_open   = 1;
+
+  for (;;) {
+    if (!sock_open)
+      break;
+
+    fds[0].fd      = stdin_open ? STDIN_FILENO : -1;
+    fds[0].events  = POLLIN;
+    fds[0].revents = 0;
+    fds[1].fd      = sock_open ? sock_fd : -1;
+    fds[1].events  = POLLIN;
+    fds[1].revents = 0;
+
+    int r = poll(fds, 2, -1);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+
+    if (fds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
+      uint8_t type;
+      uint32_t len;
+      if (recv_pkt(sock_fd, &type, buf, sizeof(buf), &len) != 0) {
+        sock_open = 0;
+      } else if (type == PKT_DATA && len > 0) {
+        if (write_all(STDOUT_FILENO, buf, len) != 0)
+          sock_open = 0;
+      } else if (type == PKT_STDERR && len > 0) {
+        if (write_all(STDERR_FILENO, buf, len) != 0)
+          sock_open = 0;
+      } else if (type == PKT_EXIT && len == sizeof(int32_t)) {
+        int32_t net_status;
+        memcpy(&net_status, buf, sizeof(net_status));
+        raw_status = (int)ntohl(net_status);
+        sock_open = 0;
+      }
+    }
+
+    if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+      ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+      if (n < 0 && errno == EINTR)
+        continue;
+      if (n <= 0) {
+        stdin_open = 0;
+        send_pkt(sock_fd, PKT_DATA, NULL, 0);   /* stdin EOF */
+      } else {
+        if (send_pkt(sock_fd, PKT_DATA, buf, (uint32_t)n) != 0)
+          stdin_open = 0;
+      }
+    }
+  }
+
+  close(sock_fd);
+
+  if (raw_status != -1) {
+    if (WIFSIGNALED(raw_status))
+      return 128 + WTERMSIG(raw_status);
+    if (WIFEXITED(raw_status))
+      return WEXITSTATUS(raw_status);
+  }
+  return 1;
 }
 
 static int run_client_loop(int sock_fd)
@@ -614,7 +986,9 @@ static void usage(const char *prog)
     "\n"
     "The server runs as the current user.  Every connecting client receives\n"
     "a login shell (sudo -i equivalent) with the server's environment.\n"
-    "Only LANG and LC_* are forwarded from the client.\n",
+    "Only LANG and LC_* are forwarded from the client.\n"
+    "When stdin/stdout/stderr are all ttys the session gets a pty;\n"
+    "otherwise the streams are relayed separately with no pty.\n",
     prog, prog, DEFAULT_HOST, DEFAULT_PORT);
 }
 
@@ -664,6 +1038,12 @@ int main(int argc, char *argv[])
     return 0;
   }
 
+  /* Snapshot the fd shape before connect_to_server() opens the socket
+     (which reuses the lowest free number, e.g. 0 after "<&-"). Extra
+     fds past stderr cannot cross TCP, so only the pty/no-pty decision
+     travels: all std fds ttys -> pty session, else relayed pipes. */
+  int use_pipe = !fwd_std_all_tty();
+
   int sock_fd = connect_to_server(host, port);
   if (sock_fd < 0) {
     fprintf(stderr, "connect: cannot connect to %s:%d: %s\n",
@@ -677,9 +1057,10 @@ int main(int argc, char *argv[])
     setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   }
 
-  /* Send the greeting: terminal size + locale blob. */
+  /* Send the greeting: terminal size, session mode, locale blob. */
   struct connect_hello hello;
   memset(&hello, 0, sizeof(hello));
+  hello.pipe_mode = use_pipe;
   {
     struct winsize ws;
     if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0) {
@@ -736,6 +1117,9 @@ int main(int argc, char *argv[])
     setsockopt(sock_fd, IPPROTO_TCP, TCP_KEEPIDLE, &val, sizeof(val));
 #endif
   }
+
+  if (use_pipe)
+    return run_client_pipe_loop(sock_fd);
 
   return run_client_loop(sock_fd);
 }

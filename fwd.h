@@ -8,7 +8,10 @@
    sends the open fds in increasing order over a Unix socket with
    SCM_RIGHTS, and the server dups them onto the same numbers in the
    child. Pipes stay pipes, files stay files, /dev/null stays /dev/null,
-   closed stays closed. */
+   closed stays closed.
+   fwd_send/fwd_recv/fwd_install need an AF_UNIX socket (SCM_RIGHTS);
+   transports without fd passing (e.g. connect's TCP) relay the byte
+   streams instead and only reuse the snapshot/decision helpers. */
 
 #define FWD_MAX_FDS 64
 #define FWD_STASH_BASE 256
@@ -22,6 +25,9 @@ int fwd_recv(int sock, int *out, int n);
 
 /* Close every fd >= 0 in the array. */
 void fwd_close_all(int *fds, int n);
+
+/* Close every fd >= lo except the nkeep entries in keep. */
+void fwd_close_from(int lo, const int *keep, int nkeep);
 
 /* Child-side: dup received fds onto their target numbers in [lo, 63].
    recv holds n fds in increasing target order for bits set in mask.
