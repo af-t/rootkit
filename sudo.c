@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 
+#include "fwd.h"
 #include "io.h"
 #include "tty.h"
 
@@ -48,6 +49,8 @@ struct sudo_req {
   unsigned short rows;
   unsigned short cols;
   int argc;
+  int pipe_mode;      /* 0 = pty (0,1,2 are ttys), 1 = forward fds */
+  uint64_t fd_mask;   /* bit i set = fd i is open on client, sent in order */
   char cwd[PATH_MAX];
   char args[2048];
 };
@@ -56,6 +59,7 @@ struct sudo_req {
 struct session {
   pid_t pid;
   int client_fd;
+  time_t hung_since;   /* first hangup sighting, 0 while client is present */
 };
 static struct session sessions[MAX_SESSIONS];
 static int n_sessions;
@@ -507,24 +511,12 @@ static void escape_cgroup(void)
   }
 }
 
-static void run_child(struct sudo_req *req, char *env_buf, uint32_t env_size,
-                      int slave_fd)
+static void do_exec(struct sudo_req *req, char *env_buf, uint32_t env_size)
 {
   char *exec_args[MAX_ARGS];
   int argi = 0;
   char *exec_path;
   char *shell;
-
-  /* Still root here: leave the caller's cgroup before dropping privileges. */
-  escape_cgroup();
-
-  setsid();
-  ioctl(slave_fd, TIOCSCTTY, 0);
-  dup2(slave_fd, STDIN_FILENO);
-  dup2(slave_fd, STDOUT_FILENO);
-  dup2(slave_fd, STDERR_FILENO);
-  if (slave_fd > STDERR_FILENO)
-    close(slave_fd);
 
   if (env_buf)
     apply_environment(env_buf, env_size);
@@ -602,6 +594,41 @@ static void run_child(struct sudo_req *req, char *env_buf, uint32_t env_size,
   _exit(126);
 }
 
+static void run_child(struct sudo_req *req, char *env_buf, uint32_t env_size,
+                      int slave_fd, uint64_t extra_mask, int *extra_fds,
+                      int n_extra)
+{
+  /* Still root here: leave the caller's cgroup before dropping privileges. */
+  escape_cgroup();
+
+  setsid();
+  ioctl(slave_fd, TIOCSCTTY, 0);
+  dup2(slave_fd, STDIN_FILENO);
+  dup2(slave_fd, STDOUT_FILENO);
+  dup2(slave_fd, STDERR_FILENO);
+  if (slave_fd > STDERR_FILENO)
+    close(slave_fd);
+
+  /* Even with no extras this closes everything >= 3, so daemon fds
+     never leak into the session. */
+  fwd_install(extra_mask, extra_fds, n_extra, 3);
+
+  do_exec(req, env_buf, env_size);
+}
+
+static void run_child_pipe(struct sudo_req *req, char *env_buf,
+                           uint32_t env_size, uint64_t mask, int *fds, int n)
+{
+  escape_cgroup();
+
+  setsid();
+
+  /* With n == 0 this just closes everything >= 0. */
+  fwd_install(mask, fds, n, 0);
+
+  do_exec(req, env_buf, env_size);
+}
+
 static void track_session(pid_t pid, int client_fd)
 {
   if (n_sessions < MAX_SESSIONS) {
@@ -640,9 +667,14 @@ static void handle_connection(int server_fd)
   struct sudo_req req;
   uint32_t env_size = 0;
   char *env_buf = NULL;
-  int master_fd, slave_fd;
+  int master_fd = -1, slave_fd = -1;
+  int fwd_fds[FWD_MAX_FDS];
+  int n_fwd = 0;
   struct winsize ws;
   pid_t pid;
+
+  for (int i = 0; i < FWD_MAX_FDS; i++)
+    fwd_fds[i] = -1;
 
   int client_fd = accept(server_fd, NULL, NULL);
   if (client_fd < 0)
@@ -654,7 +686,9 @@ static void handle_connection(int server_fd)
   memset(&req, 0, sizeof(req));
   if (read_all(client_fd, &req, sizeof(req)) != 0 ||
       read_all(client_fd, &env_size, sizeof(env_size)) != 0 ||
-      env_size > MAX_ENV_SIZE || req.argc < 0 || req.argc > MAX_ARGS - 1) {
+      env_size > MAX_ENV_SIZE || req.argc < 0 || req.argc > MAX_ARGS - 1 ||
+      (req.pipe_mode != 0 && req.pipe_mode != 1) ||
+      (!req.pipe_mode && (req.fd_mask & 0x7ULL))) {
     close(client_fd);
     return;
   }
@@ -668,44 +702,108 @@ static void handle_connection(int server_fd)
     }
   }
 
-  ws.ws_row = req.rows;
-  ws.ws_col = req.cols;
-  ws.ws_xpixel = 0;
-  ws.ws_ypixel = 0;
-
-  if (openpty(&master_fd, &slave_fd, NULL, NULL, &ws) != 0) {
+  n_fwd = fwd_count(req.fd_mask);
+  if (n_fwd > FWD_MAX_FDS) {
+    free(env_buf);
+    close(client_fd);
+    return;
+  }
+  if (n_fwd > 0 && fwd_recv(client_fd, fwd_fds, n_fwd) != 0) {
     free(env_buf);
     close(client_fd);
     return;
   }
 
-  pid = fork();
-  if (pid == 0) {
-    close(server_fd);
-    close(client_fd);
-    close(master_fd);
-    if (sigchld_pipe[0] >= 0)
-      close(sigchld_pipe[0]);
-    if (sigchld_pipe[1] >= 0)
-      close(sigchld_pipe[1]);
-    run_child(&req, env_buf, env_size, slave_fd);
-  } else if (pid > 0) {
-    close(slave_fd);
-    if (send_fd(client_fd, master_fd) < 0) {
-      kill(pid, SIGKILL);   /* client gone: don't leave a root shell adrift */
+  if (!req.pipe_mode) {
+    ws.ws_row = req.rows;
+    ws.ws_col = req.cols;
+    ws.ws_xpixel = 0;
+    ws.ws_ypixel = 0;
+
+    if (openpty(&master_fd, &slave_fd, NULL, NULL, &ws) != 0) {
+      fwd_close_all(fwd_fds, n_fwd);
+      free(env_buf);
       close(client_fd);
-    } else {
-      track_session(pid, client_fd);
+      return;
     }
-    close(master_fd);
-    total_served++;
+
+    pid = fork();
+    if (pid == 0) {
+      close(server_fd);
+      close(client_fd);
+      close(master_fd);
+      if (sigchld_pipe[0] >= 0)
+        close(sigchld_pipe[0]);
+      if (sigchld_pipe[1] >= 0)
+        close(sigchld_pipe[1]);
+      run_child(&req, env_buf, env_size, slave_fd, req.fd_mask,
+                fwd_fds, n_fwd);
+    } else if (pid > 0) {
+      close(slave_fd);
+      fwd_close_all(fwd_fds, n_fwd);
+      if (send_fd(client_fd, master_fd) < 0) {
+        kill(pid, SIGKILL);   /* client gone: don't leave a root shell adrift */
+        close(client_fd);
+      } else {
+        track_session(pid, client_fd);
+      }
+      close(master_fd);
+      total_served++;
+    } else {
+      close(slave_fd);
+      close(master_fd);
+      fwd_close_all(fwd_fds, n_fwd);
+      close(client_fd);
+    }
   } else {
-    close(slave_fd);
-    close(master_fd);
-    close(client_fd);
+    pid = fork();
+    if (pid == 0) {
+      close(server_fd);
+      close(client_fd);
+      if (sigchld_pipe[0] >= 0)
+        close(sigchld_pipe[0]);
+      if (sigchld_pipe[1] >= 0)
+        close(sigchld_pipe[1]);
+      run_child_pipe(&req, env_buf, env_size, req.fd_mask, fwd_fds,
+                     n_fwd);
+    } else if (pid > 0) {
+      fwd_close_all(fwd_fds, n_fwd);
+      track_session(pid, client_fd);
+      total_served++;
+    } else {
+      fwd_close_all(fwd_fds, n_fwd);
+      close(client_fd);
+    }
   }
 
   free(env_buf);
+}
+
+/* Client went away while its child still runs: hang it up so no root
+   process is left adrift (SIGKILL after 3s for SIGHUP ignorers, or the
+   child would pin the session and block daemon self-exit). The reap
+   path then drops the connection. Pids here are our own unreaped
+   children, so no recycled-pid risk. */
+static void kill_hungup_clients(void)
+{
+  time_t now = time(NULL);
+
+  for (int i = 0; i < n_sessions; i++) {
+    char b;
+    ssize_t r = recv(sessions[i].client_fd, &b, 1,
+                     MSG_PEEK | MSG_DONTWAIT);
+    if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                   errno != EINTR)) {
+      if (sessions[i].hung_since == 0) {
+        sessions[i].hung_since = now;
+        kill(sessions[i].pid, SIGHUP);
+      } else if (now - sessions[i].hung_since >= 3) {
+        kill(sessions[i].pid, SIGKILL);
+      }
+    } else {
+      sessions[i].hung_since = 0;
+    }
+  }
 }
 
 static void run_server(void)
@@ -796,6 +894,10 @@ static void run_server(void)
       if (pfd[0].revents & POLLIN)
         handle_connection(server_fd);
     }
+
+    /* Client gone while its child still runs: don't leave root adrift. */
+    if (n_sessions > 0)
+      kill_hungup_clients();
 
     /* Nothing pending and no live session: safe to self-exit. */
     if (pr == 0 && total_served > 0 && n_sessions == 0)
@@ -1063,11 +1165,28 @@ int main(int argc, char *argv[])
     req.cols = 80;
   }
 
+  /* Snapshot fd shape before connect_server() opens the socket (which
+     reuses the lowest free number, e.g. 0 after "<&-"). */
+  uint64_t open_mask = fwd_snapshot();
+
+  /* All std fds are ttys -> classic pty session (extras still forwarded).
+     Anything else (pipe/file//dev/null/closed) -> forward the shape. */
+  if (fwd_std_all_tty()) {
+    req.pipe_mode = 0;
+    req.fd_mask = open_mask & ~0x7ULL;
+  } else {
+    req.pipe_mode = 1;
+    req.fd_mask = open_mask;
+  }
+
   socket_fd = connect_server();
   if (socket_fd < 0) {
     fprintf(stderr, "sudo: cannot reach the daemon\n");
     return 1;
   }
+
+  int fwd_list[FWD_MAX_FDS];
+  int n_fwd = fwd_collect(&req.fd_mask, socket_fd, fwd_list);
 
   /* Bound recv_fd so a daemon that self-exits mid-connect cannot hang us. */
   {
@@ -1096,6 +1215,17 @@ int main(int argc, char *argv[])
       close(socket_fd);
       return 1;
     }
+  }
+
+  if (n_fwd > 0 && fwd_send(socket_fd, fwd_list, n_fwd) != 0) {
+    fprintf(stderr, "sudo: failed to send file descriptors\n");
+    close(socket_fd);
+    return 1;
+  }
+
+  if (req.pipe_mode) {
+    /* Clear the handshake timeout; piped commands may run long. */
+    return fwd_wait_status(socket_fd);
   }
 
   master_fd = recv_fd(socket_fd);

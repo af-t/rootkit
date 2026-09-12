@@ -49,8 +49,8 @@ endif
 endif
 
 TARGET  := rootlet
-LIB     := io.o tty.o
-HDR     := io.h tty.h
+LIB     := io.o tty.o fwd.o
+HDR     := io.h tty.h fwd.h
 
 $(TARGET): rootlet.c $(LIB) $(HDR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ rootlet.c $(LIB) $(LDLIBS)
