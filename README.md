@@ -15,7 +15,9 @@ with the session's own status.
 make
 ```
 
-Produces a single `rootlet` binary. Compiled with `-Wall -Wextra -Werror`.
+Produces `dist/rootlet`; `make sudo` and `make connect` produce
+`dist/sudo` and `dist/connect`. Object files are stored under `dist/deps/`.
+Compiled with `-Wall -Wextra -Werror`.
 `LDFLAGS`/`LDLIBS` are honored at link time. For profile-guided
 optimization: `make PGO=generate`, exercise every binary's real code
 paths, `make clean`, `make PGO=use` (`PROFDIR` overrides the profile

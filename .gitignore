@@ -2,3 +2,4 @@
 /sudo
 /connect
 *.o
+/dist/

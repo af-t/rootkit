@@ -1,4 +1,6 @@
 CC      ?= cc
+CPPFLAGS ?=
+CPPFLAGS += -Iheader
 CFLAGS  ?= -std=gnu11 -O2
 CFLAGS  += -Wall -Wextra -Werror
 LDFLAGS ?=
@@ -17,6 +19,8 @@ PREFIX  ?= /usr/local
 # (requires llvm-profdata).
 PGO     ?=
 PROFDIR ?= $(CURDIR)/pgo-data
+DIST_DIR ?= dist
+DEPS_DIR ?= $(DIST_DIR)/deps
 ifneq ($(PGO),)
 # Heuristic; override on the command line if it guesses wrong.
 PGO_IS_CLANG ?= $(findstring clang,$(shell $(CC) --version 2>/dev/null))
@@ -49,23 +53,39 @@ endif
 endif
 
 TARGET  := rootlet
-LIB     := io.o tty.o fwd.o
-HDR     := io.h tty.h fwd.h
+LIB     := $(DEPS_DIR)/io.o $(DEPS_DIR)/tty.o $(DEPS_DIR)/fwd.o
+HDR     := header/io.h header/tty.h header/fwd.h
 
-$(TARGET): rootlet.c $(LIB) $(HDR)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ rootlet.c $(LIB) $(LDLIBS)
+.PHONY: all rootlet sudo connect install clean distclean pgo-merge
 
-sudo: sudo.c $(LIB) $(HDR)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ sudo.c $(LIB) $(LDLIBS)
+all: rootlet
 
-connect: connect.c $(LIB) $(HDR)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ connect.c $(LIB) $(LDLIBS) -lpthread
+rootlet: $(DIST_DIR)/$(TARGET)
 
-$(LIB): %.o: %.c $(HDR)
-	$(CC) $(CFLAGS) -c -o $@ $<
+$(DIST_DIR)/$(TARGET): src/rootlet.c $(LIB) $(HDR) | $(DIST_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ src/rootlet.c $(LIB) $(LDLIBS)
 
-install: $(TARGET)
-	install -D -m 0755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+sudo: $(DIST_DIR)/sudo
+
+$(DIST_DIR)/sudo: src/sudo.c $(LIB) $(HDR) | $(DIST_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ src/sudo.c $(LIB) $(LDLIBS)
+
+connect: $(DIST_DIR)/connect
+
+$(DIST_DIR)/connect: src/connect.c $(LIB) $(HDR) | $(DIST_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ src/connect.c $(LIB) $(LDLIBS) -lpthread
+
+$(DEPS_DIR)/%.o: src/lib/%.c $(HDR) | $(DEPS_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+$(DIST_DIR):
+	mkdir -p $@
+
+$(DEPS_DIR): | $(DIST_DIR)
+	mkdir -p $@
+
+install: rootlet
+	install -D -m 0755 $(DIST_DIR)/$(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
 
 # Merge clang raw profiles for the use build. Plain merge: -sparse drops
 # records the use build needs, failing it under -Werror.
@@ -75,6 +95,7 @@ pgo-merge:
 	"$(LLVM_PROFDATA)" merge -o "$(PROFDIR)/merged.profdata" "$(PROFDIR)"/*.profraw
 
 clean:
+	rm -rf $(DIST_DIR)
 	rm -f $(TARGET) sudo connect *.o *.gcno *.gcda
 
 # clean plus any collected PGO profiles (kept by clean so a

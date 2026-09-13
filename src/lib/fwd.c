@@ -176,7 +176,7 @@ void fwd_close_from(int lo, const int *keep, int nkeep)
 
 void fwd_install(uint64_t mask, int *recv, int n, int lo)
 {
-  int stash[FWD_MAX_FDS];
+  int stash[FWD_MAX_FDS] = { 0 };
   int targets[FWD_MAX_FDS];
   int ns = 0;
   int idx = 0;
