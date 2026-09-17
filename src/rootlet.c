@@ -42,9 +42,17 @@ struct bind {
 };
 
 static char distro_path[PATH_MAX];
+/* -i source:subpath, without the slashes: empty when no subpath given. */
+static char image_sub[256];
+/* -i names a directory bound at the root instead of an image file. */
+static int image_is_dir;
 /* Short enough that every subpath cp() appends still fits in PATH_MAX. */
 static char chroot_path[PATH_MAX - 256];
 static size_t chroot_len;
+/* The session root: chroot_path itself, or one level down with
+   -i source:subpath. cp() targets live here; the teardown still sweeps
+   the whole tree at chroot_path. */
+static char setup_path[PATH_MAX];
 /* Shallowest directory the teardown may remove, and SIZE_MAX while this run
    has created none: a mount point that was already there is left alone. */
 static size_t chroot_created = SIZE_MAX;
@@ -57,14 +65,12 @@ static size_t bind_count;
 static char loop_nodes[MAX_LOOPS][32];
 static int loop_fds[MAX_LOOPS];
 static size_t loop_count;
-/* Flocked files, held open until exit so the exclusion outlives a crash:
-   every image this run mounts, plus rootfs/.lock when the root is a plain
-   directory with no image to lock. */
+/* Flocked image files, held open until exit so the exclusion outlives a
+   crash. Anything else needs no lock file: once its mounts are in the
+   tree, a second run already aborts on them. */
 static const char *locked_paths[MAX_LOOPS + 1];
 static int lock_fds[MAX_LOOPS + 1];
 static size_t lock_count;
-static char lock_path[PATH_MAX];
-static int lock_bind_mounted;
 static int ns_enabled;
 static int debug_enabled;
 static int rootfs_mounted;
@@ -72,7 +78,7 @@ static int cleanup_done;
 static volatile sig_atomic_t session_gone;
 static volatile sig_atomic_t stop_signal;
 
-/* Build "<chroot_path><sub>" into one of a few rotating buffers, so one
+/* Build "<setup_path><sub>" into one of a few rotating buffers, so one
    expression can hold several results. */
 static const char *cp(const char *sub)
 {
@@ -80,7 +86,7 @@ static const char *cp(const char *sub)
   static unsigned turn;
   char *buf = bufs[turn++ % (sizeof(bufs) / sizeof(bufs[0]))];
 
-  snprintf(buf, PATH_MAX, "%s%s", chroot_path, sub);
+  snprintf(buf, PATH_MAX, "%s%s", setup_path, sub);
   return buf;
 }
 
@@ -403,9 +409,9 @@ static void probe_rootfs(void)
   if (!debug_enabled)
     return;
 
-  dir = opendir(chroot_path);
+  dir = opendir(setup_path);
   if (!dir) {
-    dbg("opendir %s: %s", chroot_path, strerror(errno));
+    dbg("opendir %s: %s", setup_path, strerror(errno));
     return;
   }
 
@@ -486,52 +492,6 @@ static void lock_image_file(const char *path)
   dbg("locked %s", path);
 }
 
-/* Exclusion for a root no image backs: there is no image file to flock, so
-   the lock lives in the tree itself, assembled from -b binds. Best effort
-   against deletion from inside: the lock is bound onto itself, so
-   unlinking it there fails with EBUSY. The host side can still reach the
-   file; that is an accepted shortcoming of this strategy. */
-static void setup_dir_lock(void)
-{
-  int fd;
-
-  if ((size_t)snprintf(lock_path, sizeof(lock_path), "%s/.lock",
-           chroot_path) >= sizeof(lock_path)) {
-    fprintf(stderr, "lock path is too long\n");
-    exit(1);
-  }
-
-  if (lock_count >= sizeof(lock_fds) / sizeof(lock_fds[0])) {
-    fprintf(stderr, "too many locked files\n");
-    exit(1);
-  }
-
-  fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-  if (fd < 0)
-    die(lock_path);
-
-  if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
-    if (errno == EWOULDBLOCK)
-      fprintf(stderr, "%s: already in use by another rootlet\n",
-        chroot_path);
-    else
-      fprintf(stderr, "flock %s: %s\n", lock_path, strerror(errno));
-    exit(1);
-  }
-
-  locked_paths[lock_count] = lock_path;
-  lock_fds[lock_count] = fd;
-  lock_count++;
-  dbg("locked %s", lock_path);
-
-  if (mount(lock_path, lock_path, NULL, MS_BIND, NULL) == 0) {
-    lock_bind_mounted = 1;
-    dbg("lock bound onto itself: %s", lock_path);
-  } else {
-    dbg("lock bind %s: %s", lock_path, strerror(errno));
-  }
-}
-
 /* mountinfo escapes space, tab, newline and backslash as octal. */
 static void unescape_octal(char *s)
 {
@@ -601,12 +561,12 @@ static void do_mount(void)
   if (mkdir_p(chroot_path, &chroot_created) != 0)
     die(chroot_path);
 
-  /* The tree arrives clean (checked in main) and holds no image yet: -i
-     mounts one at it, otherwise -b binds assemble the tree in place.
-     Failing the image setup is fatal, with the reason already reported
-     above. Tracking comes first so the teardown still detaches the
-     loop. */
-  if (distro_path[0] != '\0') {
+  /* The tree arrives clean (checked in main) and holds no root yet: -i
+     provides one (an image file loop-mounted, or a directory bound),
+     otherwise -b binds assemble the tree in place. Failing the root
+     setup is fatal, with the reason already reported above. Loop
+     tracking comes first so the teardown still detaches the device. */
+  if (distro_path[0] != '\0' && !image_is_dir) {
     fd = attach_image(distro_path, node, sizeof(node));
     if (fd < 0)
       exit(1);
@@ -616,13 +576,51 @@ static void do_mount(void)
     rootfs_mounted = 1;
   }
 
-  /* No image backing the root means no image file to flock. */
-  if (!rootfs_mounted)
-    setup_dir_lock();
+  /* No image backing the root means no image file to flock, and none is
+     needed: the mounts below already mark the tree, so a second run
+     aborts on them. */
+  if (image_is_dir) {
+    if (mount(distro_path, chroot_path, NULL, MS_BIND, NULL) != 0) {
+      fprintf(stderr, "bind %s -> %s: %s\n", distro_path, chroot_path,
+        strerror(errno));
+      exit(1);
+    }
+    /* Like an image mount, the bind at the root itself is not covered by
+       the straggler sweep under it, so the teardown must drop it too. */
+    rootfs_mounted = 1;
+  }
+
+  /* With -i source:subpath the session lives one level down: the standard
+     mounts, the -b binds and the chroot all target it, while the teardown
+     still sweeps the whole tree. */
+  if (image_sub[0] != '\0') {
+    if ((size_t)snprintf(setup_path, sizeof(setup_path), "%s/%s",
+          chroot_path, image_sub) >= sizeof(setup_path)) {
+      fprintf(stderr, "setup path is too long\n");
+      exit(1);
+    }
+    if (mkdir_p(setup_path, NULL) != 0)
+      die(setup_path);
+  } else if ((size_t)snprintf(setup_path, sizeof(setup_path), "%s",
+        chroot_path) >= sizeof(setup_path)) {
+    fprintf(stderr, "setup path is too long\n");
+    exit(1);
+  }
 
   /* Detach the tree from its peer group, so the mounts below only show up
      here and peers just see chroot_path itself. */
   mount_soft(NULL, chroot_path, NULL, MS_REC | MS_PRIVATE, NULL);
+
+  /* The image may lack them and a bare -m always does: the standard
+     targets are created first, so their mounts do not fail with ENOENT. */
+  {
+    static const char *const std_dirs[] = {
+      "/sys", "/dev", "/dev/pts", "/proc", "/mnt", "/tmp",
+    };
+
+    for (i = 0; i < sizeof(std_dirs) / sizeof(std_dirs[0]); i++)
+      mkdir_p(cp(std_dirs[i]), NULL);
+  }
 
   mount_soft("/sys", cp("/sys"), NULL, MS_BIND, NULL);
   mount_soft("/dev", cp("/dev"), NULL, MS_BIND, NULL);
@@ -767,22 +765,13 @@ static void remove_mountpoint(void)
 
 /* Registered with atexit(), so a die() once the setup is underway still
    releases the loop devices and the mounts. The straggler sweep runs
-   unconditionally: with a plain-directory root the extra mounts exist
-   without rootfs_mounted. */
+   unconditionally; the root mount itself (-i image or directory) is
+   dropped right after, since the sweep only covers what is under it. */
 static void cleanup(void)
 {
   if (cleanup_done)
     return;
   cleanup_done = 1;
-
-  /* The lock's self bind sits inside the tree; drop it first, quietly: it
-     is strictly under chroot_path, so the sweep below would clear it anyway
-     when it is still mounted. */
-  if (lock_bind_mounted) {
-    lock_bind_mounted = 0;
-    if (umount2(lock_path, 0) != 0)
-      dbg("umount %s: %s", lock_path, strerror(errno));
-  }
 
   unmount_stragglers();
 
@@ -1066,9 +1055,9 @@ static void exec_session(int slave)
 
   attach_pty(slave);
 
-  if (chdir(chroot_path) != 0 || chroot(chroot_path) != 0 ||
+  if (chdir(setup_path) != 0 || chroot(setup_path) != 0 ||
       chdir("/") != 0) {
-    fprintf(stderr, "chroot %s: %s\n", chroot_path, strerror(errno));
+    fprintf(stderr, "chroot %s: %s\n", setup_path, strerror(errno));
     _exit(125);
   }
 
@@ -1248,12 +1237,14 @@ static int has_dotdot_component(const char *path)
 static void usage(const char *prog)
 {
   fprintf(stderr,
-    "usage: %s -m mountpoint [-i image] [-s login] "
+    "usage: %s -m mountpoint [-i source[:subpath]] [-s login] "
     "[-b host[:guest]]... [-p] [-d]\n"
     "  -m mountpoint   absolute path used as the container root (required;\n"
     "                  must hold no mounts when the run starts)\n"
-    "  -i image        distro image file loop-mounted at the root\n"
-    "                  (optional; without it -b binds assemble the tree)\n"
+    "  -i source       root source (optional): an image file loop-mounted\n"
+    "                  at the root, or a directory bind-mounted there;\n"
+    "                  with :subpath the session is set up and chrooted\n"
+    "                  at <root>/subpath instead\n"
     "  -s login        login program run inside the chroot (default %s)\n"
     "  -b host[:guest] bind host path into the chroot at guest\n"
     "                  (guest defaults to host); the guest must not be /\n"
@@ -1357,23 +1348,44 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  /* -i is optional and has no default: without it -b binds assemble the
-     tree in place. */
+  /* -i is optional and has no default: an image file loop-mounted at the
+     root, or a directory bound there instead; an appended :subpath moves
+     the session setup and the chroot one level down. Plain -m with
+     neither is fine too: the tree then holds just the standard mounts. */
   if (image) {
-    if ((size_t)snprintf(distro_path, sizeof(distro_path), "%s", image) >=
-        sizeof(distro_path)) {
-      fprintf(stderr, "distro image path is too long\n");
+    const char *sep = strchr(image, ':');
+    size_t srclen = sep ? (size_t)(sep - image) : strlen(image);
+    struct stat st;
+
+    if (srclen == 0 || srclen >= sizeof(distro_path)) {
+      fprintf(stderr, "bad -i source: %s\n", image);
       return 1;
     }
-  }
+    memcpy(distro_path, image, srclen);
+    distro_path[srclen] = '\0';
 
-  /* The root is purely assembled: -i, or at least one -b. An empty -m
-     with nothing to put in it is a usage error, not a session. */
-  if (!image && bind_count == 0) {
-    fprintf(stderr, "%s: no root: give -i image or at least one -b\n",
-      argv[0]);
-    usage(argv[0]);
-    return 1;
+    if (sep) {
+      const char *sub = sep + 1;
+      size_t sublen;
+
+      while (*sub == '/')
+        sub++;
+      sublen = strlen(sub);
+      while (sublen > 0 && sub[sublen - 1] == '/')
+        sublen--;
+      if (sublen >= sizeof(image_sub)) {
+        fprintf(stderr, "-i subpath is too long\n");
+        return 1;
+      }
+      memcpy(image_sub, sub, sublen);
+      image_sub[sublen] = '\0';
+      if (image_sub[0] != '\0' && has_dotdot_component(image_sub)) {
+        fprintf(stderr, "-i subpath must not contain '..': %s\n", image);
+        return 1;
+      }
+    }
+
+    image_is_dir = stat(distro_path, &st) == 0 && S_ISDIR(st.st_mode);
   }
 
   /* Absolute because the cleanup scan matches it against /proc/<pid> links;
@@ -1416,7 +1428,7 @@ int main(int argc, char **argv)
 
   /* Every image this run mounts is locked before anything else, so a
      second run fails instead of mounting the same image twice. */
-  if (image)
+  if (image && !image_is_dir)
     lock_image_file(distro_path);
   for (i = 0; i < bind_count; i++)
     if (binds[i].is_image)

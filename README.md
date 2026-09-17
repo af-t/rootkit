@@ -28,29 +28,47 @@ directory; with clang, run `make pgo-merge` before the use build).
 ## Usage
 
 Run as root. The container root (`-m`, required) is purely assembled:
-an image loop-mounted at it with `-i`, or `-b` binds mounted into it
-(even `-b /bin:/bin -b /usr:/usr` alone is enough to produce a
-rootfs-equivalent directory):
+an image loop-mounted at it with `-i`, a directory bound at it with
+`-i dir`, `-b` binds mounted into it (even `-b /bin:/bin
+-b /usr:/usr` alone is enough to produce a rootfs-equivalent
+directory), or nothing at all — a bare `-m` holds just the standard
+mounts:
 
 ```sh
 rootlet -m /mnt/ubuntu -i ~/ubuntu.img
+rootlet -m /mnt/agent -i /srv/agent
 rootlet -m /mnt/agent -b /bin:/bin -b /usr:/usr -b /etc:/etc -d
+rootlet -m /mnt/bare
 ```
 
-Without `-i` and without at least one `-b` there is no root, and rootlet
-prints the usage and exits 1. A `-b` guest of `/` is rejected: the `/`
-mount itself always comes from `-i`, never from a bind. The `-m` path
+With `-i source:subpath` the session is set up one level down instead:
+an image is mounted at the root and the tree is assembled at
+`<root>/subpath`, which is then the chroot:
+
+```sh
+rootlet -m /mnt/agent -i ~/sparse.img:/rootfs
+rootlet -m /mnt/agent -i /srv/agent:/rootfs -b /data:/data
+```
+
+The subpath is relative to the mounted root, must exist or be
+creatable, and must not contain `..`. A `-b` guest of `/` is rejected:
+the `/` mount itself always comes from `-i`, never from a bind. The
+`-m` path
 must hold no mounts when the run starts — neither as a mount point
 itself nor with mounts anywhere under it (checked in
 `/proc/self/mountinfo`) — because the teardown unmounts everything at
-or under it on exit, so pre-existing mounts there would conflict.
+or under it on exit, so pre-existing mounts there would conflict. That
+mount state is also the whole exclusion between runs: once a run has
+put its mounts in the tree, any other run targeting it aborts on them.
 
 Options:
 
 ```
 -m mountpoint   absolute path used as the container root (required)
--i image        distro image file loop-mounted at the root (optional;
-                without it -b binds assemble the tree)
+-i source       root source (optional): an image file loop-mounted at
+                the root, or a directory bind-mounted there; with
+                :subpath the session is set up and chrooted at
+                <root>/subpath instead
 -s login        login program run inside the chroot (default /usr/bin/su)
 -b host[:guest] bind host path into the chroot at guest; guest defaults to
                 host and must be absolute, and must not be /; a
@@ -85,16 +103,12 @@ An extra `-b` that fails to mount only warns and the run continues; a
 root image that fails to attach or mount aborts the run.
 
 Locking: an image-backed root flocks the image file, so a second run
-fails instead of mounting the same image twice. A `-b`-assembled root
-is not a mount point and has no image to lock, so rootlet flocks
-`<root>/.lock` instead — a second run finding it locked aborts — and
-bind-mounts it onto itself: deleting it from inside the container then
-fails with EBUSY. That bind is best effort; the host can still reach
-the file.
+fails instead of mounting the same image twice. Nothing else needs a
+lock file.
 
 ## Requirements
 
 - Root privileges (loop devices, `mount`, `chroot`).
 - A root filesystem: an image with an ext4/ext3/ext2/f2fs (or
   erofs/squashfs, for `-b` image mounts) filesystem, or host directories
-  to assemble the tree with `-b`.
+  to bind (`-i dir`) or assemble the tree with (`-b`).
