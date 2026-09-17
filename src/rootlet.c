@@ -26,16 +26,19 @@
 #include "io.h"
 #include "tty.h"
 
-#define DEFAULT_MOUNT "/mnt/ubuntu"
 #define DEFAULT_SU "/usr/bin/su"
 #define TERM_GRACE_SECONDS 3
 #define SESSION_DRAIN_MS 200
 #define MAX_BINDS 64
 
-/* A -b bind; "guest" is the path inside the tree, defaulting to "host". */
+/* A -b bind; "guest" is the path inside the tree, defaulting to "host".
+   A regular-file host is a filesystem image to loop-mount rather than a
+   path to bind. Binds are extra mounts only: the root itself always comes
+   from -i, so "/" is rejected as a guest. */
 struct bind {
   const char *host;
   const char *guest;
+  int is_image;
 };
 
 static char distro_path[PATH_MAX];
@@ -48,9 +51,20 @@ static size_t chroot_created = SIZE_MAX;
 static const char *su_path = DEFAULT_SU;
 static struct bind binds[MAX_BINDS];
 static size_t bind_count;
-static char loop_node[32];
-static int loop_fd = -1;
-static int lock_fd = -1;
+/* One loop device per image: -i plus at most one per -b. Detached in
+   reverse attach order by loop_detach_all(). */
+#define MAX_LOOPS (MAX_BINDS + 1)
+static char loop_nodes[MAX_LOOPS][32];
+static int loop_fds[MAX_LOOPS];
+static size_t loop_count;
+/* Flocked files, held open until exit so the exclusion outlives a crash:
+   every image this run mounts, plus rootfs/.lock when the root is a plain
+   directory with no image to lock. */
+static const char *locked_paths[MAX_LOOPS + 1];
+static int lock_fds[MAX_LOOPS + 1];
+static size_t lock_count;
+static char lock_path[PATH_MAX];
+static int lock_bind_mounted;
 static int ns_enabled;
 static int debug_enabled;
 static int rootfs_mounted;
@@ -127,7 +141,7 @@ static int mkdir_p(const char *path, size_t *created)
 
 /* Android keeps block nodes under /dev/block, and ueventd can create a
    freshly allocated one slightly after LOOP_CTL_GET_FREE returns. */
-static int open_loop_node(int number)
+static int open_loop_node(int number, char *node, size_t node_size)
 {
   static const char *const dirs[] = { "/dev/block", "/dev" };
   struct timespec delay = { 0, 100 * 1000 * 1000 };
@@ -138,14 +152,14 @@ static int open_loop_node(int number)
     for (i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
       int fd;
 
-      snprintf(loop_node, sizeof(loop_node), "%s/loop%d",
+      snprintf(node, node_size, "%s/loop%d",
          dirs[i], number);
 
-      fd = open(loop_node, O_RDWR | O_CLOEXEC);
+      fd = open(node, O_RDWR | O_CLOEXEC);
       if (fd >= 0)
         return fd;
 
-      dbg("open %s: %s", loop_node, strerror(errno));
+      dbg("open %s: %s", node, strerror(errno));
       if (errno != ENOENT)
         return -1;
     }
@@ -153,114 +167,156 @@ static int open_loop_node(int number)
     nanosleep(&delay, NULL);
   }
 
-  snprintf(loop_node, sizeof(loop_node), "loop%d", number);
+  snprintf(node, node_size, "loop%d", number);
   errno = ENOENT;
   return -1;
 }
 
-static void loop_attach(void)
+/* Attaches "img_path" to a free loop device: the node path goes into
+   "node" and the loop fd is returned, or -1 on failure after reporting
+   it. The caller decides whether that is fatal (the root) or a warning
+   (an extra -b). */
+static int attach_image(const char *img_path, char *node, size_t node_size)
 {
   struct loop_info64 info;
   size_t name_len;
-  int ctl, img, attempt;
+  int ctl, img, fd = -1, attempt;
 
   ctl = open("/dev/loop-control", O_RDWR | O_CLOEXEC);
-  if (ctl < 0)
-    die("open /dev/loop-control");
+  if (ctl < 0) {
+    fprintf(stderr, "open /dev/loop-control: %s\n", strerror(errno));
+    return -1;
+  }
 
-  img = open(distro_path, O_RDWR | O_CLOEXEC);
-  if (img < 0)
-    die(distro_path);
+  img = open(img_path, O_RDWR | O_CLOEXEC);
+  if (img < 0) {
+    fprintf(stderr, "%s: %s\n", img_path, strerror(errno));
+    close(ctl);
+    return -1;
+  }
 
   /* GET_FREE only reserves a number; a racing attach can take it first. */
-  for (attempt = 0; attempt < 16; attempt++) {
-    int node;
+  for (attempt = 0; attempt < 16 && fd < 0; attempt++) {
+    int number;
 
-    node = ioctl(ctl, LOOP_CTL_GET_FREE);
-    if (node < 0)
-      die("LOOP_CTL_GET_FREE");
-
-    dbg("LOOP_CTL_GET_FREE -> %d", node);
-
-    loop_fd = open_loop_node(node);
-    if (loop_fd < 0) {
-      fprintf(stderr, "%s: %s (tried /dev/block and /dev)\n",
-        loop_node, strerror(errno));
-      exit(1);
+    number = ioctl(ctl, LOOP_CTL_GET_FREE);
+    if (number < 0) {
+      fprintf(stderr, "LOOP_CTL_GET_FREE: %s\n", strerror(errno));
+      break;
     }
 
-    if (ioctl(loop_fd, LOOP_SET_FD, img) == 0)
+    dbg("LOOP_CTL_GET_FREE -> %d", number);
+
+    fd = open_loop_node(number, node, node_size);
+    if (fd < 0) {
+      fprintf(stderr, "%s: %s (tried /dev/block and /dev)\n",
+        node, strerror(errno));
+      break;
+    }
+
+    if (ioctl(fd, LOOP_SET_FD, img) == 0)
       break;
 
-    dbg("LOOP_SET_FD %s: %s", loop_node, strerror(errno));
-    if (errno != EBUSY)
-      die("LOOP_SET_FD");
+    dbg("LOOP_SET_FD %s: %s", node, strerror(errno));
+    if (errno != EBUSY) {
+      fprintf(stderr, "LOOP_SET_FD: %s\n", strerror(errno));
+      close(fd);
+      fd = -1;
+      break;
+    }
 
-    close(loop_fd);
-    loop_fd = -1;
+    close(fd);
+    fd = -1;
   }
 
   close(img);
   close(ctl);
 
-  if (loop_fd < 0) {
-    fprintf(stderr, "no free loop device\n");
-    exit(1);
+  if (fd < 0) {
+    if (attempt >= 16)
+      fprintf(stderr, "no free loop device\n");
+    return -1;
   }
 
-  dbg("attached %s -> %s", loop_node, distro_path);
+  dbg("attached %s -> %s", node, img_path);
 
   /* Cosmetic: makes `losetup -l` show the backing file, truncated to fit. */
   memset(&info, 0, sizeof(info));
-  name_len = strlen(distro_path);
+  name_len = strlen(img_path);
   if (name_len >= sizeof(info.lo_file_name))
     name_len = sizeof(info.lo_file_name) - 1;
-  memcpy(info.lo_file_name, distro_path, name_len);
-  ioctl(loop_fd, LOOP_SET_STATUS64, &info);
+  memcpy(info.lo_file_name, img_path, name_len);
+  ioctl(fd, LOOP_SET_STATUS64, &info);
+
+  return fd;
 }
 
-static void loop_detach(void)
+static void track_loop(int fd, const char *node)
 {
-  if (loop_fd < 0)
-    return;
+  if (loop_count >= MAX_LOOPS) {
+    fprintf(stderr, "too many attached images (max %d)\n", MAX_LOOPS);
+    exit(1);
+  }
 
-  if (ioctl(loop_fd, LOOP_CLR_FD, 0) != 0)
-    fprintf(stderr, "detach %s: %s\n", loop_node, strerror(errno));
-  else
-    dbg("detached %s", loop_node);
-
-  close(loop_fd);
-  loop_fd = -1;
+  snprintf(loop_nodes[loop_count], sizeof(loop_nodes[loop_count]), "%s",
+    node);
+  loop_fds[loop_count] = fd;
+  loop_count++;
 }
 
-static int try_mount_rootfs(const char *type)
+static void loop_detach_all(void)
 {
-  if (mount(loop_node, chroot_path, type, 0, NULL) == 0) {
-    dbg("mounted %s on %s as %s", loop_node, chroot_path, type);
-    rootfs_mounted = 1;
+  while (loop_count > 0) {
+    int fd = loop_fds[--loop_count];
+    const char *node = loop_nodes[loop_count];
+
+    if (ioctl(fd, LOOP_CLR_FD, 0) != 0)
+      fprintf(stderr, "detach %s: %s\n", node, strerror(errno));
+    else
+      dbg("detached %s", node);
+
+    close(fd);
+  }
+}
+
+/* 1 when mounted, 0 when the type simply does not match, -1 on a hard
+   failure (already reported). */
+static int try_mount_type(const char *node, const char *target,
+             const char *type)
+{
+  if (mount(node, target, type, 0, NULL) == 0) {
+    dbg("mounted %s on %s as %s", node, target, type);
     return 1;
   }
 
-  dbg("try %s: %s", type, strerror(errno));
+  dbg("try %s on %s: %s", type, target, strerror(errno));
 
   /* Anything else means the type matched but the mount cannot work. */
-  if (errno != EINVAL && errno != ENODEV && errno != ENXIO)
-    die("mount rootfs");
+  if (errno != EINVAL && errno != ENODEV && errno != ENXIO) {
+    fprintf(stderr, "mount %s: %s\n", target, strerror(errno));
+    return -1;
+  }
 
   return 0;
 }
 
-/* mount(2) has no type autodetection, so replay what mount(8) would probe. */
-static void mount_rootfs(void)
+/* mount(2) has no type autodetection, so replay what mount(8) would probe.
+   Returns 0 on success, -1 on failure (already reported). */
+static int mount_image_at(const char *node, const char *target)
 {
-  static const char *const preferred[] = { "ext4", "ext3", "ext2", "f2fs" };
+  static const char *const preferred[] = {
+    "ext4", "ext3", "ext2", "f2fs", "erofs", "squashfs"
+  };
   char line[128];
   size_t i;
+  int r;
   FILE *fp;
 
-  for (i = 0; i < sizeof(preferred) / sizeof(preferred[0]); i++)
-    if (try_mount_rootfs(preferred[i]))
-      return;
+  for (i = 0; i < sizeof(preferred) / sizeof(preferred[0]); i++) {
+    r = try_mount_type(node, target, preferred[i]);
+    if (r != 0)
+      return r > 0 ? 0 : -1;
+  }
 
   fp = fopen("/proc/filesystems", "r");
   if (fp) {
@@ -283,25 +339,29 @@ static void mount_rootfs(void)
       if (i < sizeof(preferred) / sizeof(preferred[0]))
         continue;
 
-      if (try_mount_rootfs(type)) {
+      r = try_mount_type(node, target, type);
+      if (r != 0) {
         fclose(fp);
-        return;
+        return r > 0 ? 0 : -1;
       }
     }
     fclose(fp);
   }
 
-  fprintf(stderr, "mount rootfs failed: unrecognized filesystem\n");
-  exit(1);
+  fprintf(stderr, "mount %s: unrecognized filesystem\n", target);
+  return -1;
 }
 
-static void mount_soft(const char *source, const char *target,
-           const char *type, unsigned long flags, const char *data)
+static int mount_soft(const char *source, const char *target,
+            const char *type, unsigned long flags, const char *data)
 {
-  if (mount(source, target, type, flags, data) != 0)
+  if (mount(source, target, type, flags, data) != 0) {
     fprintf(stderr, "mount %s: %s\n", target, strerror(errno));
-  else
-    dbg("mount ok: %s", target);
+    return -1;
+  }
+
+  dbg("mount ok: %s", target);
+  return 0;
 }
 
 /* Symlinks are shown, not followed: from out here an absolute link resolves
@@ -361,43 +421,115 @@ static void probe_rootfs(void)
   probe_path(cp("/bin/su"));
 }
 
-/* The target is created first, so a bind onto a path the image lacks works. */
-static void mount_binds(void)
+/* Mounts one -b entry: a regular-file host is a filesystem image and gets
+   loop-mounted, anything else is bound. The target is created first, so a
+   bind onto a path the image lacks works. Returns 0 on success; a failed
+   extra only warns through the calls below. */
+static int mount_one_bind(const struct bind *b)
 {
-  size_t i;
+  const char *target = cp(b->guest);
 
-  for (i = 0; i < bind_count; i++) {
-    const char *target = cp(binds[i].guest);
+  if (mkdir_p(target, NULL) != 0) {
+    fprintf(stderr, "mkdir %s: %s\n", target, strerror(errno));
+    return -1;
+  }
 
-    if (mkdir_p(target, NULL) != 0) {
-      fprintf(stderr, "mkdir %s: %s\n", target, strerror(errno));
-      continue;
-    }
-    mount_soft(binds[i].host, target, NULL, MS_BIND, NULL);
+  if (!b->is_image)
+    return mount_soft(b->host, target, NULL, MS_BIND, NULL);
+
+  {
+    char node[32];
+    int fd = attach_image(b->host, node, sizeof(node));
+
+    if (fd < 0)
+      return -1;
+    track_loop(fd, node);
+    return mount_image_at(node, target);
   }
 }
 
 /* Serialize runs sharing an image: mounting the same read-write image twice
    corrupts it. The lock rides on the open file description, so it releases
-   even if this process crashes, and O_CLOEXEC keeps it out of the session. */
-static void acquire_lock(void)
+   even if this process crashes, and O_CLOEXEC keeps it out of the session.
+   The same path locked twice by one run (e.g. -i plus an identical -b) is
+   locked once. */
+static void lock_image_file(const char *path)
 {
-  int fd = open(distro_path, O_RDONLY | O_CLOEXEC);
+  size_t i;
+  int fd;
 
+  for (i = 0; i < lock_count; i++)
+    if (strcmp(locked_paths[i], path) == 0)
+      return;
+
+  if (lock_count >= sizeof(lock_fds) / sizeof(lock_fds[0])) {
+    fprintf(stderr, "too many locked files\n");
+    exit(1);
+  }
+
+  fd = open(path, O_RDONLY | O_CLOEXEC);
   if (fd < 0)
-    die(distro_path);
+    die(path);
 
   if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
     if (errno == EWOULDBLOCK)
       fprintf(stderr, "%s: already in use by another rootlet\n",
-        distro_path);
+        path);
     else
-      fprintf(stderr, "flock %s: %s\n", distro_path, strerror(errno));
+      fprintf(stderr, "flock %s: %s\n", path, strerror(errno));
     exit(1);
   }
 
-  lock_fd = fd;
-  dbg("locked %s", distro_path);
+  locked_paths[lock_count] = path;
+  lock_fds[lock_count] = fd;
+  lock_count++;
+  dbg("locked %s", path);
+}
+
+/* Exclusion for a root no image backs: there is no image file to flock, so
+   the lock lives in the tree itself, assembled from -b binds. Best effort
+   against deletion from inside: the lock is bound onto itself, so
+   unlinking it there fails with EBUSY. The host side can still reach the
+   file; that is an accepted shortcoming of this strategy. */
+static void setup_dir_lock(void)
+{
+  int fd;
+
+  if ((size_t)snprintf(lock_path, sizeof(lock_path), "%s/.lock",
+           chroot_path) >= sizeof(lock_path)) {
+    fprintf(stderr, "lock path is too long\n");
+    exit(1);
+  }
+
+  if (lock_count >= sizeof(lock_fds) / sizeof(lock_fds[0])) {
+    fprintf(stderr, "too many locked files\n");
+    exit(1);
+  }
+
+  fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if (fd < 0)
+    die(lock_path);
+
+  if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    if (errno == EWOULDBLOCK)
+      fprintf(stderr, "%s: already in use by another rootlet\n",
+        chroot_path);
+    else
+      fprintf(stderr, "flock %s: %s\n", lock_path, strerror(errno));
+    exit(1);
+  }
+
+  locked_paths[lock_count] = lock_path;
+  lock_fds[lock_count] = fd;
+  lock_count++;
+  dbg("locked %s", lock_path);
+
+  if (mount(lock_path, lock_path, NULL, MS_BIND, NULL) == 0) {
+    lock_bind_mounted = 1;
+    dbg("lock bound onto itself: %s", lock_path);
+  } else {
+    dbg("lock bind %s: %s", lock_path, strerror(errno));
+  }
 }
 
 /* mountinfo escapes space, tab, newline and backslash as octal. */
@@ -419,20 +551,23 @@ static void unescape_octal(char *s)
   *out = '\0';
 }
 
-/* The image lock does not cover the mount point, so two runs with different
-   images could stack on one. The teardown of whichever left first would then
-   kill the other session's processes, which it matches by path. */
-static int mount_point_busy(void)
+/* A run tears down every mount at or under chroot_path on exit, so the
+   tree must hold none when it starts: mounts owned by someone else would
+   be torn down too and conflict. Returns 1 when chroot_path itself is a
+   mount point, 2 when something is mounted strictly beneath it, 0 when
+   the tree is clear. Reads /proc/self/mountinfo directly. */
+static int tree_has_mounts(void)
 {
   char line[PATH_MAX * 2];
-  int busy = 0;
+  int exact = 0;
+  int beneath = 0;
   FILE *fp;
 
   fp = fopen("/proc/self/mountinfo", "r");
   if (!fp)
     return 0;
 
-  while (!busy && fgets(line, sizeof(line), fp)) {
+  while (fgets(line, sizeof(line), fp)) {
     char *field = line;
     int i;
 
@@ -444,27 +579,46 @@ static int mount_point_busy(void)
     field[strcspn(field, " \r\n")] = '\0';
 
     unescape_octal(field);
-    busy = strcmp(field, chroot_path) == 0;
+    if (strcmp(field, chroot_path) == 0) {
+      exact = 1;
+      break;
+    }
+    if (strncmp(field, chroot_path, chroot_len) == 0 &&
+        field[chroot_len] == '/')
+      beneath = 1;
   }
 
   fclose(fp);
-  return busy;
+  return exact ? 1 : beneath ? 2 : 0;
 }
 
 static void do_mount(void)
 {
-  if (mount_point_busy()) {
-    fprintf(stderr, "%s: already a mount point, unmount it first\n",
-      chroot_path);
-    exit(1);
-  }
-
-  loop_attach();
+  size_t i;
+  char node[32];
+  int fd;
 
   if (mkdir_p(chroot_path, &chroot_created) != 0)
     die(chroot_path);
 
-  mount_rootfs();
+  /* The tree arrives clean (checked in main) and holds no image yet: -i
+     mounts one at it, otherwise -b binds assemble the tree in place.
+     Failing the image setup is fatal, with the reason already reported
+     above. Tracking comes first so the teardown still detaches the
+     loop. */
+  if (distro_path[0] != '\0') {
+    fd = attach_image(distro_path, node, sizeof(node));
+    if (fd < 0)
+      exit(1);
+    track_loop(fd, node);
+    if (mount_image_at(node, chroot_path) != 0)
+      exit(1);
+    rootfs_mounted = 1;
+  }
+
+  /* No image backing the root means no image file to flock. */
+  if (!rootfs_mounted)
+    setup_dir_lock();
 
   /* Detach the tree from its peer group, so the mounts below only show up
      here and peers just see chroot_path itself. */
@@ -477,7 +631,8 @@ static void do_mount(void)
   mount_soft("tmpfs", cp("/mnt"), "tmpfs", 0, "size=20%,mode=0755");
   mount_soft("tmpfs", cp("/tmp"), "tmpfs", 0, "size=50%,mode=1777");
 
-  mount_binds();
+  for (i = 0; i < bind_count; i++)
+    mount_one_bind(&binds[i]);
 
   probe_rootfs();
 }
@@ -492,7 +647,7 @@ static int umount_soft(const char *target)
   return 0;
 }
 
-/* mountinfo parsing shared with mount_point_busy(): the mount point is the
+/* mountinfo parsing shared with tree_has_mounts(): the mount point is the
    fifth space separated field, octal-escaped. Written into "out" and returns
    1 when it falls strictly under chroot_path (chroot_path itself excluded,
    that one is unmounted separately once everything below it is clear). */
@@ -581,13 +736,6 @@ static void unmount_stragglers(void)
   free(paths);
 }
 
-static void do_umount(void)
-{
-  unmount_stragglers();
-
-  umount_soft(chroot_path);
-}
-
 /* Removes the mount point and every parent this run created for it. A
    directory that was already there, or that is not empty, simply stays. */
 static void remove_mountpoint(void)
@@ -617,18 +765,31 @@ static void remove_mountpoint(void)
   }
 }
 
-/* Registered with atexit(), so a die() once the image is attached still
-   releases the loop device and the mounts. */
+/* Registered with atexit(), so a die() once the setup is underway still
+   releases the loop devices and the mounts. The straggler sweep runs
+   unconditionally: with a plain-directory root the extra mounts exist
+   without rootfs_mounted. */
 static void cleanup(void)
 {
   if (cleanup_done)
     return;
   cleanup_done = 1;
 
-  if (rootfs_mounted)
-    do_umount();
+  /* The lock's self bind sits inside the tree; drop it first, quietly: it
+     is strictly under chroot_path, so the sweep below would clear it anyway
+     when it is still mounted. */
+  if (lock_bind_mounted) {
+    lock_bind_mounted = 0;
+    if (umount2(lock_path, 0) != 0)
+      dbg("umount %s: %s", lock_path, strerror(errno));
+  }
 
-  loop_detach();
+  unmount_stragglers();
+
+  if (rootfs_mounted)
+    umount_soft(chroot_path);
+
+  loop_detach_all();
   remove_mountpoint();
 }
 
@@ -1087,25 +1248,28 @@ static int has_dotdot_component(const char *path)
 static void usage(const char *prog)
 {
   fprintf(stderr,
-    "usage: %s [-i image] [-m mountpoint] [-s login] "
+    "usage: %s -m mountpoint [-i image] [-s login] "
     "[-b host[:guest]]... [-p] [-d]\n"
-    "  -i image        distro image file (default $HOME/distro.img)\n"
-    "  -m mountpoint   absolute path to mount and chroot into "
-    "(default %s)\n"
+    "  -m mountpoint   absolute path used as the container root (required;\n"
+    "                  must hold no mounts when the run starts)\n"
+    "  -i image        distro image file loop-mounted at the root\n"
+    "                  (optional; without it -b binds assemble the tree)\n"
     "  -s login        login program run inside the chroot (default %s)\n"
     "  -b host[:guest] bind host path into the chroot at guest\n"
-    "                  (guest defaults to host); repeatable\n"
+    "                  (guest defaults to host); the guest must not be /\n"
+    "                  (the root comes from -i, never from a bind); a\n"
+    "                  regular-file host is loop-mounted as an image\n"
+    "                  instead of bound; repeatable\n"
     "  -p              run the session in new PID and mount namespaces\n"
     "  -d              enable debug output (same as DEBUG=1)\n",
-    prog, DEFAULT_MOUNT, DEFAULT_SU);
+    prog, DEFAULT_SU);
 }
 
 int main(int argc, char **argv)
 {
-  const char *home = getenv("HOME");
   const char *image = NULL;
-  const char *mount_at = DEFAULT_MOUNT;
-  size_t len;
+  const char *mount_at = NULL;
+  size_t len, i;
   int status;
   int opt;
 
@@ -1124,6 +1288,7 @@ int main(int argc, char **argv)
       break;
     case 'b': {
       char *sep = strchr(optarg, ':');
+      struct stat st;
 
       if (bind_count >= MAX_BINDS) {
         fprintf(stderr, "too many -b binds (max %d)\n", MAX_BINDS);
@@ -1147,6 +1312,27 @@ int main(int argc, char **argv)
           binds[bind_count].guest);
         return 1;
       }
+      /* Normalize like the mount point itself. The guest is part of
+         optarg, so it is mutable. */
+      {
+        char *guest = (char *)binds[bind_count].guest;
+        size_t glen = strlen(guest);
+
+        while (glen > 1 && guest[glen - 1] == '/')
+          guest[--glen] = '\0';
+      }
+      /* The root comes from -i, never from a bind: "/" would stack a
+         mount exactly where the image (or nothing) belongs. */
+      if (strcmp(binds[bind_count].guest, "/") == 0) {
+        fprintf(stderr, "bind target must not be '/': the root comes "
+          "from -i\n");
+        return 1;
+      }
+      /* A regular file is not something to bind: it is a filesystem
+         image to loop-mount (e.g. an erofs/squashfs file). Anything
+         stat cannot see stays a bind and fails, softly, at mount. */
+      binds[bind_count].is_image =
+        stat(binds[bind_count].host, &st) == 0 && S_ISREG(st.st_mode);
       bind_count++;
       break;
     }
@@ -1165,22 +1351,29 @@ int main(int argc, char **argv)
     }
   }
 
+  /* The root is mandatory; without it there is nothing to enter. */
+  if (!mount_at) {
+    usage(argv[0]);
+    return 1;
+  }
+
+  /* -i is optional and has no default: without it -b binds assemble the
+     tree in place. */
   if (image) {
     if ((size_t)snprintf(distro_path, sizeof(distro_path), "%s", image) >=
         sizeof(distro_path)) {
       fprintf(stderr, "distro image path is too long\n");
       return 1;
     }
-  } else {
-    if (!home || !*home) {
-      fprintf(stderr, "HOME is not set and no image given (-i)\n");
-      return 1;
-    }
-    if ((size_t)snprintf(distro_path, sizeof(distro_path), "%s/distro.img",
-             home) >= sizeof(distro_path)) {
-      fprintf(stderr, "distro image path is too long\n");
-      return 1;
-    }
+  }
+
+  /* The root is purely assembled: -i, or at least one -b. An empty -m
+     with nothing to put in it is a usage error, not a session. */
+  if (!image && bind_count == 0) {
+    fprintf(stderr, "%s: no root: give -i image or at least one -b\n",
+      argv[0]);
+    usage(argv[0]);
+    return 1;
   }
 
   /* Absolute because the cleanup scan matches it against /proc/<pid> links;
@@ -1204,11 +1397,30 @@ int main(int argc, char **argv)
   chroot_path[len] = '\0';
   chroot_len = len;
 
+  /* The teardown sweeps every mount at or under the tree, so a tree that
+     already holds mounts is refused before anything is locked or made. */
+  switch (tree_has_mounts()) {
+  case 1:
+    fprintf(stderr, "%s: already a mount point, unmount it first\n",
+      chroot_path);
+    return 1;
+  case 2:
+    fprintf(stderr, "%s: contains mounts, unmount them first\n",
+      chroot_path);
+    return 1;
+  }
+
   dbg("image=%s", distro_path);
   dbg("mount=%s", chroot_path);
   dbg("login=%s", su_path);
 
-  acquire_lock();
+  /* Every image this run mounts is locked before anything else, so a
+     second run fails instead of mounting the same image twice. */
+  if (image)
+    lock_image_file(distro_path);
+  for (i = 0; i < bind_count; i++)
+    if (binds[i].is_image)
+      lock_image_file(binds[i].host);
 
   if (atexit(cleanup) != 0) {
     fprintf(stderr, "cannot register the teardown\n");
@@ -1222,8 +1434,8 @@ int main(int argc, char **argv)
   kill_chroot_processes();
   cleanup();
 
-  if (lock_fd >= 0)
-    close(lock_fd);
+  for (i = 0; i < lock_count; i++)
+    close(lock_fds[i]);
 
   /* Die from the stop signal the way a program without a handler would, now
      that the teardown it would have skipped is done. */
