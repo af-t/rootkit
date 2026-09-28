@@ -1,11 +1,14 @@
 CC      ?= cc
 CPPFLAGS ?=
 CPPFLAGS += -Iheader
-CFLAGS  ?= -std=gnu11 -O2
+CFLAGS  ?= -std=c23 -O2
 CFLAGS  += -Wall -Wextra -Werror
 LDFLAGS ?=
-LDLIBS  ?=
+LDLIBS  ?= -lpthread
 PREFIX  ?= /usr/local
+
+FUSE3_CFLAGS := $(shell pkg-config --cflags fuse3 2>/dev/null)
+FUSE3_LIBS   := $(shell pkg-config --libs fuse3 2>/dev/null)
 
 # Profile-guided optimization:
 #   make PGO=generate [PROFDIR=...]
@@ -42,7 +45,11 @@ PGO_DATA  := $(shell find "$(PROFDIR)" -name '*.gcda' 2>/dev/null)
 PGO_FLAGS := -fprofile-use=$(PROFDIR)
 else
 PGO_DATA  := $(wildcard $(PROFDIR)/merged.profdata)
-PGO_FLAGS := -fprofile-instr-use=$(PROFDIR)/merged.profdata
+# rootlet/sudo/connect share lib objs but link different subsets, so a
+# profile from one binary misses TUs used only by another. That is a
+# warning (-Wprofile-instr-unprofiled), which -Werror would turn into an
+# error, so keep it a warning.
+PGO_FLAGS := -fprofile-instr-use=$(PROFDIR)/merged.profdata -Wno-error=profile-instr-unprofiled
 endif
 ifeq ($(PGO_DATA),)
 $(info PGO=use: no profiles in $(PROFDIR); building without PGO)
@@ -56,7 +63,7 @@ TARGET  := rootlet
 LIB     := $(DEPS_DIR)/io.o $(DEPS_DIR)/tty.o $(DEPS_DIR)/fwd.o
 HDR     := header/io.h header/tty.h header/fwd.h
 
-.PHONY: all rootlet sudo connect install clean distclean pgo-merge
+.PHONY: all rootlet sudo connect fcache install clean distclean pgo-merge
 
 all: rootlet
 
@@ -74,6 +81,11 @@ connect: $(DIST_DIR)/connect
 
 $(DIST_DIR)/connect: src/connect.c $(LIB) $(HDR) | $(DIST_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ src/connect.c $(LIB) $(LDLIBS) -lpthread
+
+fcache: $(DIST_DIR)/fcache
+
+$(DIST_DIR)/fcache: src/fcache.c | $(DIST_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FUSE3_CFLAGS) $(LDFLAGS) -o $@ src/fcache.c $(LDLIBS) $(FUSE3_LIBS)
 
 $(DEPS_DIR)/%.o: src/lib/%.c $(HDR) | $(DEPS_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
@@ -96,7 +108,7 @@ pgo-merge:
 
 clean:
 	rm -rf $(DIST_DIR)
-	rm -f $(TARGET) sudo connect *.o *.gcno *.gcda
+	rm -f $(TARGET) sudo connect fcache *.o *.gcno *.gcda
 
 # clean plus any collected PGO profiles (kept by clean so a
 # generate -> clean -> use cycle still finds them).
