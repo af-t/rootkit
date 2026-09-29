@@ -17,8 +17,9 @@ with the session's own status.
 make
 ```
 
-Produces `dist/rootlet`; `make sudo` and `make connect` produce
-`dist/sudo` and `dist/connect`. Object files are stored under `dist/deps/`.
+Produces `dist/rootlet`, `dist/sudo`, `dist/connect`, and `dist/fcache`
+(`make <name>` builds just one; `make fcache` needs the libfuse3 dev
+headers). Object files are stored under `dist/deps/`.
 Compiled with `-Wall -Wextra -Werror`.
 `LDFLAGS`/`LDLIBS` are honored at link time. For profile-guided
 optimization: `make PGO=generate`, exercise every binary's real code

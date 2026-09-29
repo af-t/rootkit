@@ -65,7 +65,7 @@ HDR     := header/io.h header/tty.h header/fwd.h
 
 .PHONY: all rootlet sudo connect fcache install clean distclean pgo-merge
 
-all: rootlet
+all: rootlet sudo connect fcache
 
 rootlet: $(DIST_DIR)/$(TARGET)
 

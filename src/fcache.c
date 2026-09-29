@@ -21,7 +21,9 @@
 #include <limits.h>
 #include <pthread.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <signal.h>
+#include <ctype.h>
 #include <sys/mount.h>
 
 struct fcache_mount_opts {
@@ -38,13 +40,17 @@ struct fcache_mount_opts {
 struct fcache_config {
     char cache_dir[PATH_MAX];
     char remote_dir[PATH_MAX];
+    // 0 = no quota; bounded only by filesystem free space (set via -o cache_size=256M).
+    uint64_t max_cache_bytes;
     struct fcache_mount_opts mount_opts;
 };
 
 struct fcache_file_handle {
     int cache_fd;
     int remote_fd;
+    int open_flags;
     off_t file_size;
+    struct fcache_config *cfg;
     char *remote_path;
     char *cache_path;
     char tmp_path[PATH_MAX];
@@ -57,6 +63,9 @@ struct fcache_file_handle {
     int is_cache_backed;
     pthread_t cache_thread;
 };
+
+// Serializes eviction vs tmp creation so two fillers can't both see space, then both hit ENOSPC.
+static pthread_mutex_t g_evict_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void usage(const char *prog) {
     fprintf(stderr,
@@ -71,11 +80,41 @@ static void usage(const char *prog) {
         "                  uid=N               set mount point owner uid\n"
         "                  gid=N               set mount point owner gid\n"
         "                  umask=NNN           file creation mask, overrides caller umask\n"
+        "                  cache_size=SIZE     cap cache usage (e.g. 256M, 1G).\n"
+        "                                    default 0 = bounded only by\n"
+        "                                    filesystem free space\n"
         "  -h              show this help\n",
         prog);
 }
 
-static int parse_mount_opts(const char *optstr, struct fcache_mount_opts *opts) {
+[[nodiscard]] static int parse_size(const char *s, uint64_t *out) {
+    if (!s || !*s) return -EINVAL;
+    char *end = NULL;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (end == s) return -EINVAL;
+    uint64_t mul = 1;
+    if (*end) {
+        switch (tolower((unsigned char)*end)) {
+        case 'k': mul = (uint64_t)1024; end++; break;
+        case 'm': mul = (uint64_t)1024 * 1024; end++; break;
+        case 'g': mul = (uint64_t)1024 * 1024 * 1024; end++; break;
+        default: return -EINVAL;
+        }
+        if (tolower((unsigned char)*end) == 'i') {
+            end++;
+            if (tolower((unsigned char)*end) == 'b') end++;
+        } else if (tolower((unsigned char)*end) == 'b') {
+            end++;
+        }
+    }
+    if (*end) return -EINVAL;
+    if (v > UINT64_MAX / mul) return -EINVAL;
+    *out = (uint64_t)v * mul;
+    return 0;
+}
+
+static int parse_mount_opts(const char *optstr, struct fcache_mount_opts *opts,
+                            uint64_t *max_cache_bytes) {
     char *copy = strdup(optstr);
     if (!copy) return -ENOMEM;
 
@@ -94,6 +133,12 @@ static int parse_mount_opts(const char *optstr, struct fcache_mount_opts *opts) 
         } else if (strncmp(token, "umask=", 6) == 0) {
             opts->umask = (mode_t)strtoul(token + 6, NULL, 8);
             opts->umask_set = 1;
+        } else if (strncmp(token, "cache_size=", 11) == 0) {
+            if (parse_size(token + 11, max_cache_bytes) != 0) {
+                fprintf(stderr, "fcache: invalid cache_size: %s\n", token + 11);
+                free(copy);
+                return -EINVAL;
+            }
         } else {
             fprintf(stderr, "fcache: unknown mount option: %s\n", token);
             free(copy);
@@ -157,6 +202,148 @@ static void create_parent_dirs(const char *file_path) {
     return fuse_get_context()->umask;
 }
 
+// LRU over atime (not TTL): hits refresh atime, a full cache evicts least-recently-used first.
+
+// Refresh atime only (mtime must keep mirroring remote); best effort.
+static void touch_for_lru(const char *cpath) {
+    struct timespec tv[2];
+    tv[0].tv_sec = 0; tv[0].tv_nsec = UTIME_NOW;
+    tv[1].tv_sec = 0; tv[1].tv_nsec = UTIME_OMIT;
+    (void)utimensat(AT_FDCWD, cpath, tv, AT_SYMLINK_NOFOLLOW);
+}
+
+[[nodiscard]] static int is_tmp_name(const char *name) {
+    return strstr(name, ".tmp.") != NULL;
+}
+
+struct cache_entry {
+    char path[PATH_MAX];
+    uint64_t size;
+    time_t atime;
+};
+
+static void scan_dir(const char *dir, const char *except,
+                     struct cache_entry **list, size_t *n, size_t *cap) {
+    DIR *dp = opendir(dir);
+    if (!dp) return;
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        if (is_tmp_name(de->d_name)) continue;
+        char full[PATH_MAX];
+        int m = snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
+        if (m < 0 || (size_t)m >= sizeof(full)) continue;
+        if (except && strcmp(full, except) == 0) continue;
+        struct stat st;
+        if (lstat(full, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            scan_dir(full, except, list, n, cap);
+        } else if (S_ISREG(st.st_mode)) {
+            if (*n >= *cap) {
+                size_t ncap = *cap ? *cap * 2 : 64;
+                struct cache_entry *nl = realloc(*list, ncap * sizeof(**list));
+                if (!nl) break;
+                *list = nl;
+                *cap = ncap;
+            }
+            int k = snprintf((*list)[*n].path, sizeof((*list)[*n].path), "%s", full);
+            if (k < 0 || (size_t)k >= sizeof((*list)[*n].path)) continue;
+            (*list)[*n].size = (uint64_t)st.st_size;
+            (*list)[*n].atime = st.st_atime;
+            (*n)++;
+        }
+    }
+    closedir(dp);
+}
+
+static int cmp_atime(const void *a, const void *b) {
+    const struct cache_entry *ea = a, *eb = b;
+    if (ea->atime < eb->atime) return -1;
+    if (ea->atime > eb->atime) return 1;
+    return 0;
+}
+
+[[nodiscard]] static uint64_t cache_fs_total(struct fcache_config *cfg) {
+    struct statvfs sv;
+    if (statvfs(cfg->cache_dir, &sv) != 0) return UINT64_MAX;
+    return (uint64_t)sv.f_blocks * (uint64_t)sv.f_frsize;
+}
+
+[[nodiscard]] static uint64_t cache_capacity(struct fcache_config *cfg) {
+    if (cfg->max_cache_bytes > 0) return cfg->max_cache_bytes;
+    return cache_fs_total(cfg);
+}
+
+// Free `need` bytes via eviction (`except` spared, no fh lock held); -ENOSPC means bypass, not fail I/O.
+[[nodiscard]] static int ensure_cache_space(struct fcache_config *cfg,
+                                            uint64_t need, const char *except) {
+    pthread_mutex_lock(&g_evict_mutex);
+
+    uint64_t cap = cache_capacity(cfg);
+    if (need > cap) {
+        pthread_mutex_unlock(&g_evict_mutex);
+        return -ENOSPC;
+    }
+
+    struct statvfs sv;
+    uint64_t fs_free = UINT64_MAX;
+    if (statvfs(cfg->cache_dir, &sv) == 0) {
+        fs_free = (uint64_t)sv.f_bavail * (uint64_t)sv.f_frsize;
+    }
+
+    uint64_t use = 0;
+    struct cache_entry *list = NULL;
+    size_t n = 0, listcap = 0;
+    if (cfg->max_cache_bytes > 0 || fs_free < need) {
+        scan_dir(cfg->cache_dir, except, &list, &n, &listcap);
+        for (size_t i = 0; i < n; i++) use += list[i].size;
+    }
+
+    // `except` still occupies quota although unevictable; count it.
+    uint64_t excl = 0;
+    if (except) {
+        struct stat est;
+        if (stat(except, &est) == 0 && S_ISREG(est.st_mode)) {
+            excl = (uint64_t)est.st_size;
+        }
+    }
+
+    int enough = (fs_free >= need) &&
+                 (cfg->max_cache_bytes == 0 || use + excl + need <= cfg->max_cache_bytes);
+    if (!enough && n > 0) {
+        qsort(list, n, sizeof(*list), cmp_atime);
+        size_t cdlen = strlen(cfg->cache_dir);
+        // Pass 0 drops unreachable files (remote gone), pass 1 LRU over mirrored; blanked entries skipped.
+        for (int pass = 0; pass < 2 && !enough; pass++) {
+            for (size_t i = 0; i < n && !enough; i++) {
+                if (list[i].path[0] == '\0') continue;
+                if (strncmp(list[i].path, cfg->cache_dir, cdlen) != 0) {
+                    continue;
+                }
+                char rmt[PATH_MAX];
+                int m = snprintf(rmt, sizeof(rmt), "%s%s",
+                                 cfg->remote_dir, list[i].path + cdlen);
+                int reachable = (m >= 0 && (size_t)m < sizeof(rmt) &&
+                                 access(rmt, F_OK) == 0);
+                if ((pass == 0) == reachable) continue;
+                if (unlink(list[i].path) == 0) {
+                    if (use >= list[i].size) use -= list[i].size;
+                    else use = 0;
+                    if (fs_free != UINT64_MAX) fs_free += list[i].size;
+                    list[i].path[0] = '\0';
+                }
+                enough = (fs_free >= need) &&
+                         (cfg->max_cache_bytes == 0 ||
+                          use + excl + need <= cfg->max_cache_bytes);
+            }
+        }
+    }
+
+    free(list);
+    pthread_mutex_unlock(&g_evict_mutex);
+    return enough ? 0 : -ENOSPC;
+}
+
 [[nodiscard]] static void *cache_worker(void *arg) {
     struct fcache_file_handle *fh = (struct fcache_file_handle *)arg;
     char buf[128 * 1024];
@@ -166,21 +353,30 @@ static void create_parent_dirs(const char *file_path) {
 
     while ((bytes_read = pread(fh->remote_fd, buf, sizeof(buf), offset)) > 0) {
         pthread_mutex_lock(&fh->lock);
-        if (fh->cache_fd >= 0) {
-            if (pwrite(fh->cache_fd, buf, (size_t)bytes_read, offset) < 0) {
-                pthread_mutex_unlock(&fh->lock);
+        int cfd = fh->cache_fd;
+        pthread_mutex_unlock(&fh->lock);
+        if (cfd >= 0) {
+            ssize_t w = pwrite(cfd, buf, (size_t)bytes_read, offset);
+            if (w < 0 && errno == ENOSPC) {
+                // Filled mid-copy by a racer: evict, retry once, else stay uncached (reads already came from remote).
+                uint64_t remain = (fh->file_size > offset)
+                    ? (uint64_t)(fh->file_size - offset)
+                    : (uint64_t)bytes_read;
+                if (ensure_cache_space(fh->cfg, remain, NULL) == 0) {
+                    w = pwrite(cfd, buf, (size_t)bytes_read, offset);
+                }
+            }
+            if (w < 0 || (size_t)w != (size_t)bytes_read) {
                 break;
             }
         }
-        pthread_mutex_unlock(&fh->lock);
         offset += bytes_read;
     }
     if (bytes_read == 0) {
         complete = 1;
     }
 
-    // Sole finalizer: release() never joins, so teardown can't stall on
-    // slow remotes. Wait for release (cond wait, not I/O), then publish.
+    // Sole finalizer (release never joins): wait for release, then publish.
     pthread_mutex_lock(&fh->lock);
     fh->caching_done = 1;
     fh->complete = complete;
@@ -259,18 +455,39 @@ static void sweep_stale_tmps(const char *cache_path) {
     closedir(dp);
 }
 
-[[nodiscard]] static int start_background_cache(struct fcache_file_handle *fh, mode_t src_mode) {
+[[nodiscard]] static int start_background_cache(struct fcache_config *cfg,
+        struct fcache_file_handle *fh, mode_t src_mode) {
     int n = snprintf(fh->tmp_path, sizeof(fh->tmp_path), "%s.tmp.%d.%p",
                      fh->cache_path, getpid(), (void *)fh);
     if (n < 0 || (size_t)n >= sizeof(fh->tmp_path)) {
         return -ENAMETOOLONG;
     }
 
+    // Larger-than-cache files are never cached (would evict everything); serve from remote.
+    uint64_t need = fh->file_size > 0 ? (uint64_t)fh->file_size : 4096;
+    if (need > cache_capacity(cfg)) {
+        return -ENOSPC;
+    }
+    if (ensure_cache_space(cfg, need, NULL) != 0) {
+        return -ENOSPC;
+    }
+
+    // Serialize check-and-create with eviction under one lock.
+    pthread_mutex_lock(&g_evict_mutex);
     create_parent_dirs(fh->cache_path);
     sweep_stale_tmps(fh->cache_path);
 
     mode_t tmp_mode = (src_mode & 0777) != 0 ? (src_mode & 0777) : 0644;
     int fd = open(fh->tmp_path, O_WRONLY | O_CREAT | O_TRUNC, tmp_mode);
+    if (fd < 0 && errno == ENOSPC) {
+        pthread_mutex_unlock(&g_evict_mutex);
+        if (ensure_cache_space(cfg, need, NULL) != 0) {
+            return -ENOSPC;
+        }
+        pthread_mutex_lock(&g_evict_mutex);
+        fd = open(fh->tmp_path, O_WRONLY | O_CREAT | O_TRUNC, tmp_mode);
+    }
+    pthread_mutex_unlock(&g_evict_mutex);
     if (fd < 0) return -errno;
 
     pthread_mutex_lock(&fh->lock);
@@ -292,12 +509,13 @@ static void sweep_stale_tmps(const char *cache_path) {
     return 0;
 }
 
-[[nodiscard]] static struct fcache_file_handle *new_direct_handle(int fd,
+[[nodiscard]] static struct fcache_file_handle *new_direct_handle(int fd, int flags,
         const char *rpath, const char *cpath, int is_cache_backed) {
     struct fcache_file_handle *fh = calloc(1, sizeof(*fh));
     if (!fh) return NULL;
     fh->cache_fd = fd;
     fh->remote_fd = -1;
+    fh->open_flags = flags;
     fh->caching_done = 1;
     fh->is_streaming = 0;
     fh->is_cache_backed = is_cache_backed;
@@ -321,9 +539,22 @@ static void free_handle(struct fcache_file_handle *fh) {
     free(fh);
 }
 
+// Drop a too-small cache copy and continue on remote; caller holds fh->lock.
+[[nodiscard]] static int convert_direct_to_remote(struct fcache_file_handle *fh) {
+    int flags = fh->open_flags & ~(O_CREAT | O_TRUNC | O_EXCL);
+    int rfd = open(fh->remote_path, flags | O_CREAT, 0644);
+    if (rfd < 0) return -errno;
+    if (fh->cache_fd >= 0) close(fh->cache_fd);
+    fh->cache_fd = rfd;
+    fh->is_cache_backed = 0;
+    if (fh->cache_path) unlink(fh->cache_path);
+    return 0;
+}
+
 [[nodiscard]] static int fcache_statfs(const char *path, struct statvfs *stbuf) {
     (void) path;
     struct fcache_config *cfg = get_config();
+    // Advertise remote size: bypassed writes fail only when remote itself is full.
     if (statvfs(cfg->remote_dir, stbuf) != 0) {
         return -errno;
     }
@@ -340,12 +571,8 @@ static void free_handle(struct fcache_file_handle *fh) {
         return -EPERM;
     }
 
-    if (stat(cpath, stbuf) == 0) {
-        if (cfg->mount_opts.uid_set) stbuf->st_uid = cfg->mount_opts.uid;
-        if (cfg->mount_opts.gid_set) stbuf->st_gid = cfg->mount_opts.gid;
-        return 0;
-    }
-
+    // Remote-authoritative: missing from remote means nonexistent, stale cache copy or not.
+    (void) cpath;
     if (stat(rpath, stbuf) == 0) {
         if (cfg->mount_opts.uid_set) stbuf->st_uid = cfg->mount_opts.uid;
         if (cfg->mount_opts.gid_set) stbuf->st_gid = cfg->mount_opts.gid;
@@ -370,11 +597,10 @@ static void free_handle(struct fcache_file_handle *fh) {
         return -EPERM;
     }
 
+    // Remote-only listing: a backend deletion hides the file immediately, stale cache copy or not.
     DIR *dp = opendir(rpath);
-    if (!dp) {
-        dp = opendir(cpath);
-        if (!dp) return -errno;
-    }
+    if (!dp) return -errno;
+    (void) cpath;
 
     struct dirent *de;
     while ((de = readdir(dp)) != NULL) {
@@ -382,7 +608,7 @@ static void free_handle(struct fcache_file_handle *fh) {
         memset(&st, 0, sizeof(st));
         st.st_ino = de->d_ino;
         st.st_mode = de->d_type << 12;
-        
+
         if (cfg->mount_opts.uid_set) st.st_uid = cfg->mount_opts.uid;
         if (cfg->mount_opts.gid_set) st.st_gid = cfg->mount_opts.gid;
 
@@ -405,6 +631,15 @@ static void free_handle(struct fcache_file_handle *fh) {
     int is_cached = (access(cpath, F_OK) == 0);
     int accmode = fi->flags & O_ACCMODE;
 
+    // Without O_CREAT (the kernel routes that to create), missing-from-remote means ENOENT.
+    if ((fi->flags & O_CREAT) == 0 && access(rpath, F_OK) != 0) {
+        return -ENOENT;
+    }
+
+    if (is_cached) {
+        touch_for_lru(cpath);
+    }
+
     if (!is_cached && accmode == O_RDONLY && access(rpath, F_OK) == 0) {
         int remote_fd = open(rpath, O_RDONLY);
         if (remote_fd >= 0) {
@@ -414,13 +649,15 @@ static void free_handle(struct fcache_file_handle *fh) {
                 if (fh) {
                     fh->remote_fd = remote_fd;
                     fh->cache_fd = -1;
+                    fh->open_flags = fi->flags;
                     fh->file_size = st.st_size;
+                    fh->cfg = cfg;
                     fh->remote_path = strdup(rpath);
                     fh->cache_path = strdup(cpath);
                     if (fh->remote_path && fh->cache_path) {
                         pthread_mutex_init(&fh->lock, NULL);
                         pthread_cond_init(&fh->cond, NULL);
-                        if (start_background_cache(fh, st.st_mode) == 0) {
+                        if (start_background_cache(cfg, fh, st.st_mode) == 0) {
                             fi->fh = (uintptr_t)fh;
                             return 0;
                         }
@@ -437,19 +674,33 @@ static void free_handle(struct fcache_file_handle *fh) {
     }
 
     const char *target_path = is_cached ? cpath : rpath;
+    int other_missing = 0;
     if ((fi->flags & O_TRUNC) != 0 && accmode != O_RDONLY) {
-        // open() below would truncate target_path only, leaving the
-        // other copy with a stale tail (getattr prefers cache). Cut
-        // the other side first so failure leaves target untouched.
+        // Truncate the other copy first so a failure leaves the target untouched.
         const char *other = is_cached ? rpath : cpath;
-        if (truncate(other, 0) != 0 && errno != ENOENT) {
-            return -errno;
+        if (truncate(other, 0) != 0) {
+            if (errno != ENOENT) {
+                return -errno;
+            }
+            other_missing = 1;
         }
     }
     int fd = open(target_path, fi->flags);
     if (fd < 0) return -errno;
+    if (other_missing) {
+        // O_TRUNC must leave a file on both sides; recreate the missing one (best effort).
+        struct stat tst;
+        mode_t m = 0644;
+        if (fstat(fd, &tst) == 0 && (tst.st_mode & 0777) != 0) {
+            m = tst.st_mode & 0777;
+        }
+        const char *other = is_cached ? rpath : cpath;
+        create_parent_dirs(other);
+        int ofd = open(other, O_WRONLY | O_CREAT, m);
+        if (ofd >= 0) close(ofd);
+    }
 
-    struct fcache_file_handle *fh = new_direct_handle(fd, rpath, cpath, is_cached);
+    struct fcache_file_handle *fh = new_direct_handle(fd, fi->flags, rpath, cpath, is_cached);
     if (!fh) {
         close(fd);
         return -ENOMEM;
@@ -464,31 +715,96 @@ static void free_handle(struct fcache_file_handle *fh) {
     struct fcache_file_handle *fh = (struct fcache_file_handle *)(uintptr_t)fi->fh;
     if (!fh) return -EBADF;
 
-    int fd = fh->is_streaming ? fh->remote_fd : fh->cache_fd;
-    if (fd < 0) return -EBADF;
-    ssize_t res = pread(fd, buf, size, offset);
-    if (res < 0) return -errno;
+    if (fh->is_streaming) {
+        // Reads go to remote_fd, which the worker never closes mid-stream.
+        if (fh->remote_fd < 0) return -EBADF;
+        ssize_t res = pread(fh->remote_fd, buf, size, offset);
+        if (res < 0) return -errno;
+        return (int)res;
+    }
+
+    // Lock across pread: a write-triggered conversion must not close the fd mid-read.
+    pthread_mutex_lock(&fh->lock);
+    int fd = fh->cache_fd;
+    ssize_t res = (fd >= 0) ? pread(fd, buf, size, offset) : -1;
+    int err = (res < 0) ? (fd >= 0 ? errno : EBADF) : 0;
+    pthread_mutex_unlock(&fh->lock);
+    if (res < 0) return -err;
     return (int)res;
+}
+// Mirror to remote (recreate if missing); failure fails the user write, never goes silent. Returns -errno.
+[[nodiscard]] static int mirror_to_remote(mode_t cmode, const char *rpath,
+                                         const char *buf, size_t len, off_t offset) {
+    int rfd = open(rpath, O_WRONLY);
+    if (rfd < 0 && errno == ENOENT) {
+        mode_t m = (cmode & 0777) != 0 ? (cmode & 0777) : 0644;
+        create_parent_dirs(rpath);
+        rfd = open(rpath, O_WRONLY | O_CREAT, m);
+    }
+    if (rfd < 0) return -errno;
+    ssize_t w = pwrite(rfd, buf, len, offset);
+    int e = (w < 0) ? errno : 0;
+    close(rfd);
+    if (w < 0) return -e;
+    if ((size_t)w != len) return -EIO;
+    return 0;
 }
 
 [[nodiscard]] static int fcache_write(const char *path, const char *buf, size_t size, off_t offset,
                          struct fuse_file_info *fi) {
+
     struct fcache_file_handle *fh = (struct fcache_file_handle *)(uintptr_t)fi->fh;
-    if (!fh || fh->cache_fd < 0) return -EBADF;
+    if (!fh || fh->is_streaming || fh->cache_fd < 0) return -EBADF;
 
+    struct fcache_config *cfg = get_config();
+    pthread_mutex_lock(&fh->lock);
     ssize_t res = pwrite(fh->cache_fd, buf, size, offset);
-    if (res < 0) return -errno;
+    // Save errno now: ensure_cache_space() clobbers it, and the checks below need the original reason.
+    int e = (res < 0) ? errno : 0;
+    if (res < 0 && e == ENOSPC && fh->is_cache_backed) {
+        // Cache full: evict (spares the file being grown) and retry.
+        if (ensure_cache_space(cfg, size, fh->cache_path) == 0) {
+            res = pwrite(fh->cache_fd, buf, size, offset);
+            e = (res < 0) ? errno : 0;
+        }
+    }
+    if (res < 0 && e == ENOSPC && fh->is_cache_backed) {
+        // Still full (write bigger than cache): drop the cache copy, finish on remote.
+        if (convert_direct_to_remote(fh) == 0) {
+            res = pwrite(fh->cache_fd, buf, size, offset);
+            e = (res < 0) ? errno : 0;
+        } else {
+            res = -1;
+            e = ENOSPC;
+        }
+    }
+    if (res < 0) {
+        pthread_mutex_unlock(&fh->lock);
+        return -e;
+    }
+    int backed = fh->is_cache_backed;
+    int cfd = fh->cache_fd;
+    mode_t cmode = 0;
+    if (backed && cfd >= 0) {
+        // Mirror runs unlocked; capture the mode now, never touch the fd there.
+        struct stat cst;
+        if (fstat(cfd, &cst) == 0) cmode = cst.st_mode;
+    }
+    pthread_mutex_unlock(&fh->lock);
 
-    if (!fh->is_streaming && fh->is_cache_backed) {
-        struct fcache_config *cfg = get_config();
+    if (backed && cfd >= 0) {
         char rpath[PATH_MAX];
         if (build_path(rpath, sizeof(rpath), cfg->remote_dir, path) == 0) {
-            int rfd = open(rpath, O_WRONLY);
-            if (rfd >= 0) {
-                if (pwrite(rfd, buf, (size_t)res, offset) < 0) {
-                    /* best effort write-through */
+            int mr = mirror_to_remote(cmode, rpath, buf, (size_t)res, offset);
+            if (mr != 0) {
+                // Report the mirror failure (never silent); drop the diverged copy, convert best-effort.
+                pthread_mutex_lock(&fh->lock);
+                if (fh->is_cache_backed && fh->cache_fd == cfd) {
+                    if (fh->cache_path) unlink(fh->cache_path);
+                    (void)convert_direct_to_remote(fh);
                 }
-                close(rfd);
+                pthread_mutex_unlock(&fh->lock);
+                return mr;
             }
         }
     }
@@ -514,9 +830,15 @@ static void free_handle(struct fcache_file_handle *fh) {
     if (rfd < 0) return -errno;
 
     int cfd = open(cpath, fi->flags | O_CREAT, mode);
+    if (cfd < 0 && errno == ENOSPC) {
+        // Make room instead of silently going remote-only.
+        if (ensure_cache_space(cfg, 4096, NULL) == 0) {
+            cfd = open(cpath, fi->flags | O_CREAT, mode);
+        }
+    }
     struct fcache_file_handle *fh;
     if (cfd >= 0) {
-        fh = new_direct_handle(cfd, rpath, cpath, 1);
+        fh = new_direct_handle(cfd, fi->flags, rpath, cpath, 1);
         if (!fh) {
             close(cfd);
             close(rfd);
@@ -524,7 +846,7 @@ static void free_handle(struct fcache_file_handle *fh) {
         }
         close(rfd);
     } else {
-        fh = new_direct_handle(rfd, rpath, cpath, 0);
+        fh = new_direct_handle(rfd, fi->flags, rpath, cpath, 0);
         if (!fh) {
             close(rfd);
             return -ENOMEM;
@@ -607,8 +929,10 @@ static void free_handle(struct fcache_file_handle *fh) {
     (void)build_path(cpath, sizeof(cpath), cfg->cache_dir, path);
     (void)build_path(rpath, sizeof(rpath), cfg->remote_dir, path);
 
-    unlink(cpath);
+    int cok = (unlink(cpath) == 0);
     if (unlink(rpath) != 0) {
+        // Remote already gone: deleting the surviving cache copy still fulfills the unlink.
+        if (errno == ENOENT && cok) return 0;
         return -errno;
     }
 
@@ -622,8 +946,9 @@ static void free_handle(struct fcache_file_handle *fh) {
     (void)build_path(cpath, sizeof(cpath), cfg->cache_dir, path);
     (void)build_path(rpath, sizeof(rpath), cfg->remote_dir, path);
 
-    rmdir(cpath);
+    int cok = (rmdir(cpath) == 0);
     if (rmdir(rpath) != 0) {
+        if (errno == ENOENT && cok) return 0;
         return -errno;
     }
 
@@ -636,8 +961,7 @@ static void free_handle(struct fcache_file_handle *fh) {
     if (!fh) return 0;
 
     if (fh->is_streaming) {
-        // Hand off to the worker: it finalizes and frees itself. Never
-        // join here, or teardown stalls on slow remotes (Ctrl+C looks hung).
+        // Hand off to the worker (never join: teardown would stall on slow remotes).
         pthread_mutex_lock(&fh->lock);
         fh->release_called = 1;
         pthread_cond_signal(&fh->cond);
@@ -659,10 +983,41 @@ static void free_handle(struct fcache_file_handle *fh) {
     (void)build_path(rpath, sizeof(rpath), cfg->remote_dir, path);
 
     if (truncate(cpath, size) != 0) {
-        /* cache copy may not exist yet; remote is authoritative */
+        if (errno == ENOSPC) {
+            // Full cache: evict and retry, else drop the copy so remote stays authoritative.
+            struct stat st;
+            uint64_t need = (uint64_t)(size > 0 ? size : 0);
+            if (stat(cpath, &st) == 0 && (uint64_t)size > (uint64_t)st.st_size) {
+                need = (uint64_t)size - (uint64_t)st.st_size;
+            }
+            if (ensure_cache_space(cfg, need, cpath) != 0 ||
+                truncate(cpath, size) != 0) {
+                unlink(cpath);
+            }
+        }
+        /* missing cache copy is fine; remote is authoritative */
     }
     if (truncate(rpath, size) != 0) {
-        return -errno;
+        int e = errno;
+        if (e == ENOENT) {
+            // Remote copy missing: recreate so the pair stays coherent.
+            struct stat cst;
+            mode_t m = 0644;
+            if (stat(cpath, &cst) == 0 && (cst.st_mode & 0777) != 0) {
+                m = cst.st_mode & 0777;
+            }
+            create_parent_dirs(rpath);
+            int rfd = open(rpath, O_WRONLY | O_CREAT, m);
+            if (rfd < 0) return -errno;
+            if (ftruncate(rfd, size) != 0) {
+                int fe = errno;
+                close(rfd);
+                return -fe;
+            }
+            close(rfd);
+        } else {
+            return -e;
+        }
     }
     return 0;
 }
@@ -713,6 +1068,7 @@ static void free_handle(struct fcache_file_handle *fh) {
 }
 
 static struct fcache_mount_opts g_mount_opts;
+static uint64_t g_max_cache_bytes;
 
 static void *fcache_init(struct fuse_conn_info *conn, struct fuse_config *fuse_cfg) {
     (void) fuse_cfg;
@@ -759,11 +1115,7 @@ static void phase_log(const char *msg) {
             (long)(time(NULL) - g_start_time), msg);
 }
 
-// Dedicated signal thread (sigwait, not async handlers). On first
-// INT/TERM/HUP it flags session exit AND unmounts: unmounting closes
-// the /dev/fuse fd, so loop workers blocked in read break out and the
-// MT loop wakes on every libfuse/libc combo. Relying on session-exit
-// alone stalls libfuse < 3.18 on Bionic (sem_wait with no EINTR).
+// sigwait thread: first signal exits the session AND unmounts, since exit alone stalls libfuse < 3.18 on Bionic.
 static void *signal_thread(void *arg) {
     (void)arg;
     sigset_t set;
@@ -784,10 +1136,7 @@ static void *signal_thread(void *arg) {
                 fuse_session_exit(g_session);
             }
             if (g_fuse) {
-                // Plain unmount first: under proot MNT_FORCE (which
-                // libfuse uses) can fail EINVAL-noisy while a plain
-                // umount succeeds. Once the mount is gone libfuse's
-                // own unmount goes quiet (POLLERR on the dead fd).
+                // Plain umount first: under proot, libfuse's MNT_FORCE can fail while plain umount succeeds.
                 umount2(g_mountpoint, 0);
                 fuse_unmount(g_fuse);
                 g_unmounted = 1;
@@ -804,8 +1153,7 @@ static void *signal_thread(void *arg) {
 }
 
 static void block_exit_signals(void) {
-    // Process-wide so every thread spawned later (fuse workers, cache
-    // workers) inherits the mask; only the signal thread waits on them.
+    // Process-wide so every later thread inherits it; only the signal thread waits.
     sigset_t set;
     sigemptyset(&set);
     sigaddset(&set, SIGINT);
@@ -829,6 +1177,7 @@ int main(int argc, char *argv[]) {
     int debug = 0;
     g_start_time = time(NULL);
     memset(&g_mount_opts, 0, sizeof(g_mount_opts));
+    g_max_cache_bytes = 0;
 
     while ((opt = getopt_long(argc, argv, "fdo:h", long_opts, NULL)) != -1) {
         switch (opt) {
@@ -839,7 +1188,7 @@ int main(int argc, char *argv[]) {
             debug = 1;
             break;
         case 'o':
-            if (parse_mount_opts(optarg, &g_mount_opts) != 0) {
+            if (parse_mount_opts(optarg, &g_mount_opts, &g_max_cache_bytes) != 0) {
                 return 1;
             }
             break;
@@ -870,8 +1219,7 @@ int main(int argc, char *argv[]) {
     }
 
     const char *mountpoint = argv[optind + 2];
-    // Absolute: libfuse chdir("/")s on startup, so a relative mountpoint
-    // would no longer resolve at unmount time (stale mount left behind).
+    // Absolute: libfuse chdir("/")s, so a relative mountpoint would dangle at unmount time.
     static char mount_abs[PATH_MAX];
     if (!realpath(mountpoint, mount_abs)) {
         fprintf(stderr, "fcache: mountpoint '%s': %s\n",
@@ -881,12 +1229,7 @@ int main(int argc, char *argv[]) {
     mountpoint = mount_abs;
     snprintf(g_mountpoint, sizeof(g_mountpoint), "%s", mount_abs);
 
-    // Build args for the fuse session. Only fuse-known options go here;
-    // fcache-specific ones (umask) were consumed above. Note: the
-    // mountpoint positional must NOT be included (libfuse extracts it
-    // itself in fuse_main; here we pass it to fuse_mount directly),
-    // -f never reaches libfuse (we daemonize ourselves), and -d is
-    // passed as -odebug.
+    // Only fuse-known opts here (ours consumed above); mountpoint excluded, -f is ours, -d is -odebug.
     int fuse_argc = 0;
     char *fuse_argv[16];
     char *uid_opt = NULL;
@@ -935,18 +1278,13 @@ int main(int argc, char *argv[]) {
     }
     fuse_argv[fuse_argc] = NULL;
 
-    // Store mount options in config for getattr/readdir
     cfg.mount_opts = g_mount_opts;
+    cfg.max_cache_bytes = g_max_cache_bytes;
 
-    // Daemon must not strip bits itself; create/mkdir/mknod apply the
-    // caller umask (or the mount umask override) explicitly.
+    // Daemon must not strip bits; create/mkdir/mknod apply the umask explicitly.
     umask(0);
 
-    // Same bootstrap fuse_main does (parse/new/mount/daemonize/loop),
-    // except signal handling: no async handlers and no libfuse sigwait
-    // thread. A dedicated sigwait thread owns INT/TERM/HUP and tears
-    // down via session-exit + unmount (fd revocation wakes the loop on
-    // every libfuse/libc combo); a repeat force-quits.
+    // Same bootstrap as fuse_main, minus libfuse signal handling (dedicated sigwait thread instead).
     struct fuse_args fargs = FUSE_ARGS_INIT(fuse_argc, fuse_argv);
     struct fuse *fh_fuse = fuse_new(&fargs, &fcache_ops,
                                     sizeof(fcache_ops), &cfg);
@@ -984,9 +1322,7 @@ int main(int argc, char *argv[]) {
         free(subtype_opt);
         return 1;
     }
-    // Detached: it lives until process exit. No cancel/join — Bionic
-    // with strict -std=c23 hides pthread_cancel, and joining a thread
-    // blocked in sigwait would need it.
+    // Detached: -std=c23 hides pthread_cancel on Bionic, and joining a sigwait-blocked thread needs it.
     pthread_detach(g_sigthread);
 
     {
@@ -996,9 +1332,7 @@ int main(int argc, char *argv[]) {
         phase_log(msg);
     }
 
-    // NOTE: never pass NULL here. With FUSE_USE_VERSION < 312 this
-    // dispatches to the 3.2 ABI whose converter dereferences the config.
-    // Values mirror libfuse defaults (clone_fd=0, idle disabled).
+    // Never NULL: the pre-3.12 ABI converter dereferences it; values mirror libfuse defaults.
     struct fuse_loop_config loop_cfg;
     loop_cfg.clone_fd = 0;
     loop_cfg.max_idle_threads = (unsigned int)-1;
@@ -1010,8 +1344,7 @@ int main(int argc, char *argv[]) {
                  res);
         phase_log(msg);
     }
-    // Already unmounted by the signal thread in the common case;
-    // a second unmount would just print libfuse's EINVAL noise.
+    // A second unmount would only print libfuse's EINVAL noise.
     if (!g_unmounted) {
         fuse_unmount(fh_fuse);
     }
